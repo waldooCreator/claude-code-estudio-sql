@@ -1,0 +1,14 @@
+{
+  "name": "estudio-sql",
+  "description": "Estudio SQL: un cliente SQL estilo SSMS dentro de Claude Code.",
+  "owner": {
+    "name": "waldooCreator"
+  },
+  "plugins": [
+    {
+      "name": "estudio-sql",
+      "source": "./",
+      "description": "Un cliente SQL con aspecto de SQL Server Management Studio dentro de la terminal: SQL Server, PostgreSQL, MySQL y SQLite."
+    }
+  ]
+}

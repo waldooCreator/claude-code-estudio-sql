@@ -1,0 +1,9 @@
+{
+  "name": "estudio-sql",
+  "version": "0.1.0",
+  "description": "Un cliente SQL con aspecto de SQL Server Management Studio dentro de la terminal: tus conexiones (SQL Server, PostgreSQL, MySQL, SQLite), explorador de objetos, editor con colores y resultados en cuadrícula.",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "waldooCreator"
+  }
+}
