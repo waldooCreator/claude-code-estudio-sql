@@ -87,8 +87,13 @@ func open(ctx context.Context, c Conn, database string) (*sql.DB, error) {
 	key := c.poolKey(database)
 	poolMu.Lock()
 	if p, ok := pool[key]; ok {
-		poolMu.Unlock()
-		return p.db, nil
+		if p.tunnel.alive() {
+			poolMu.Unlock()
+			return p.db, nil
+		}
+		// El túnel murió (red caída, equipo suspendido): se descarta y se abre otro.
+		p.db.Close()
+		delete(pool, key)
 	}
 	poolMu.Unlock()
 
@@ -198,6 +203,8 @@ func friendly(err error) error {
 		return fmt.Errorf("El servidor rechazó la conexión. Revisa la dirección y el puerto, y que el motor esté encendido. (%s)", s)
 	case strings.Contains(s, "i/o timeout"), strings.Contains(s, "deadline exceeded"):
 		return fmt.Errorf("El servidor no respondió a tiempo. Revisa la dirección, la VPN o Tailscale, y el firewall. (%s)", s)
+	case strings.Contains(s, "connection reset by peer"), strings.Contains(s, "broken pipe"), s == "EOF", strings.HasSuffix(s, ": EOF"):
+		return fmt.Errorf("Se perdió la conexión con el servidor (la red o el túnel SSH se cayó). Vuelve a ejecutar: se abre una conexión nueva. (%s)", s)
 	case strings.Contains(s, "no such host"):
 		return fmt.Errorf("No se encontró el servidor por ese nombre. Revisa que esté bien escrito o usa la IP. (%s)", s)
 	case strings.Contains(strings.ToLower(s), "login failed"), strings.Contains(s, "password authentication failed"), strings.Contains(s, "Access denied"):
@@ -223,14 +230,72 @@ type tunnel struct {
 	ln     net.Listener
 	client *ssh.Client
 	port   int
+	once   sync.Once
+	dead   chan struct{}
 }
+
+// Un túnel sin tráfico no se entera de que la red se cayó: cada tanto se le
+// pregunta al servidor SSH si sigue ahí, y si no contesta se da por muerto.
+const (
+	keepaliveEvery   = 15 * time.Second
+	keepaliveTimeout = 10 * time.Second
+	sshDialTimeout   = 15 * time.Second
+)
 
 func (t *tunnel) Close() {
 	if t == nil {
 		return
 	}
-	t.ln.Close()
-	t.client.Close()
+	t.once.Do(func() {
+		close(t.dead)
+		t.ln.Close()
+		t.client.Close()
+	})
+}
+
+// alive dice si el túnel sigue sirviendo; sin túnel (conexión directa) siempre.
+func (t *tunnel) alive() bool {
+	if t == nil {
+		return true
+	}
+	select {
+	case <-t.dead:
+		return false
+	default:
+		return true
+	}
+}
+
+// withTimeout corre fn y devuelve su error, o se rinde al pasar d.
+func withTimeout(d time.Duration, fn func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(d):
+		return errors.New("el servidor SSH no respondió a tiempo")
+	}
+}
+
+func (t *tunnel) keepalive() {
+	tick := time.NewTicker(keepaliveEvery)
+	defer tick.Stop()
+	for {
+		select {
+		case <-t.dead:
+			return
+		case <-tick.C:
+			err := withTimeout(keepaliveTimeout, func() error {
+				_, _, err := t.client.SendRequest("keepalive@openssh.com", true, nil)
+				return err
+			})
+			if err != nil {
+				t.Close()
+				return
+			}
+		}
+	}
 }
 
 func openTunnel(s SSHConf, target string) (*tunnel, error) {
@@ -277,7 +342,9 @@ func openTunnel(s SSHConf, target string) (*tunnel, error) {
 		client.Close()
 		return nil, err
 	}
-	t := &tunnel{ln: ln, client: client, port: ln.Addr().(*net.TCPAddr).Port}
+	t := &tunnel{ln: ln, client: client, port: ln.Addr().(*net.TCPAddr).Port, dead: make(chan struct{})}
+	go func() { client.Wait(); t.Close() }()
+	go t.keepalive()
 	go func() {
 		for {
 			local, err := ln.Accept()
@@ -285,8 +352,23 @@ func openTunnel(s SSHConf, target string) (*tunnel, error) {
 				return
 			}
 			go func() {
-				remote, err := client.Dial("tcp", target)
-				if err != nil {
+				type dialed struct {
+					conn net.Conn
+					err  error
+				}
+				ch := make(chan dialed, 1)
+				go func() { c, err := client.Dial("tcp", target); ch <- dialed{c, err} }()
+				var remote net.Conn
+				select {
+				case d := <-ch:
+					if d.err != nil {
+						local.Close()
+						return
+					}
+					remote = d.conn
+				case <-time.After(sshDialTimeout):
+					// El servidor SSH ni contesta: el túnel ya no sirve.
+					t.Close()
 					local.Close()
 					return
 				}

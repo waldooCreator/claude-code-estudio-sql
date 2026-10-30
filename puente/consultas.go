@@ -131,7 +131,7 @@ func handleQuery(in queryIn) (any, error) {
 		}
 		if err := runBatch(ctx, conn, batch, in.MaxRows, &out); err != nil {
 			out.Failed = true
-			text := err.Error()
+			text := friendly(err).Error()
 			if errors.Is(ctx.Err(), context.Canceled) {
 				text = "Consulta cancelada."
 			}
@@ -145,7 +145,7 @@ func handleQuery(in queryIn) (any, error) {
 
 var ddl = regexp.MustCompile(`(?i)^\s*(CREATE|ALTER|DROP|TRUNCATE|RENAME)\b`)
 
-var returnsRows =regexp.MustCompile(`(?i)^\s*(SELECT|WITH|PRAGMA|SHOW|EXPLAIN|VALUES|TABLE|DESCRIBE|DESC|EXEC|EXECUTE|CALL)\b|\bRETURNING\b`)
+var returnsRows = regexp.MustCompile(`(?i)^\s*(SELECT|WITH|PRAGMA|SHOW|EXPLAIN|VALUES|TABLE|DESCRIBE|DESC|EXEC|EXECUTE|CALL)\b|\bRETURNING\b`)
 
 func runBatch(ctx context.Context, conn *sql.Conn, batch string, maxRows int, out *queryOut) error {
 	clean := strings.TrimSpace(commentsAndStrings.ReplaceAllStringFunc(batch, func(m string) string {
