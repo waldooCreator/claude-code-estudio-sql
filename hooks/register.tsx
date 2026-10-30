@@ -1,11 +1,23 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Conexion, Encargo, Esquema, Modelo, Pedido, Prueba, Resultado } from '../types'
+import type { Conexion, Conjunto, Encargo, Esquema, Modelo, Objeto, Pedido, Prueba, Resultado, Vista } from '../types'
 
 const PANEL = 'estudio-sql'
-const MAX_FILAS_PANEL = 500 // las que viajan al panel; el resto se queda aquí para copiar
-const MAX_TEXTO_CELDA = 200
+const MAX_FILAS = 5000 // las que trae el puente; el panel las recorre por ventanas
+const MAX_ANCHO_COLUMNA = 40
+const MAX_TEXTO_CELDA = MAX_ANCHO_COLUMNA // el panel nunca dibuja más; el valor entero queda para copiar
+// El motor descarta el panel (y lo deja vacío) si sus props pasan de 100 000
+// caracteres o de 20 000 valores: lo que viaja se mide contra un tope menor.
+const TOPE_CARACTERES = 80_000
+const TOPE_VALORES = 15_000
+const FILAS_ADELANTE = 300
+const FILAS_ATRAS = 100
+const MAX_COLUMNAS_VENTANA = 60
+const MAX_OBJETOS_TIPO = 300
+const MAX_MENSAJES = 50
+const MAX_TEXTO_MENSAJE = 2000
+const MAX_PEGADO = 60_000
 
 const VACIO: Modelo = {
   conexiones: [],
@@ -20,8 +32,12 @@ const VACIO: Modelo = {
   encargo: null,
 }
 const modelo = atom({ plugin: 'estudio-sql', key: 'modelo' } as const, VACIO)
+const vista = atom({ plugin: 'estudio-sql', key: 'vista' } as const, { pestana: '', conjunto: 0, desde: 0, col: 0, pestanas: [], pegado: 0 } as Vista)
+const fallas = atom({ plugin: 'estudio-sql', key: 'fallas' } as const, { n: 0, motivo: '' })
 
 let columnasTerminal = 0
+/** Las pestañas que el panel tiene abiertas (null: todavía no lo dijo). */
+let vivas: Set<string> | null = null
 
 // ── Portapapeles del sistema. Muchas terminales (Ptyxis/VTE entre ellas) no
 // dejan copiar por la secuencia OSC 52, así que primero se usan las
@@ -166,13 +182,104 @@ function aTexto(v: unknown): string | null {
   return s.length > MAX_TEXTO_CELDA ? s.slice(0, MAX_TEXTO_CELDA) + '…' : s
 }
 
+/** Cuántos valores cuenta el motor en unas props (de más: también los contenedores). */
+const valores = (x: unknown): number =>
+  x === null || typeof x !== 'object' ? 1 : 1 + (Array.isArray(x) ? x : Object.values(x)).reduce((a: number, y) => a + valores(y), 0)
+
+const pesa = (x: unknown) => ({ caracteres: JSON.stringify(x).length, valores: valores(x) })
+
+const recortarMensajes = (ms: Resultado['mensajes']) =>
+  ms.slice(0, MAX_MENSAJES).map(x => (x.texto.length > MAX_TEXTO_MENSAJE ? { ...x, texto: x.texto.slice(0, MAX_TEXTO_MENSAJE) + '…' } : x))
+
+/**
+ * Lo que viaja al panel en cada dibujo: de cada pestaña su estado; filas, solo de
+ * la que está a la vista, desde la primera visible y hasta llenar el tope.
+ */
+function paraPanel(m: Modelo, v: Vista): Modelo {
+  const resultados: Record<string, Resultado> = {}
+  for (const [id, r] of Object.entries(m.resultados)) {
+    const activa = id === v.pestana
+    resultados[id] = {
+      ...r,
+      ...(r.error ? { error: r.error.slice(0, 500) } : {}),
+      mensajes: activa ? recortarMensajes(r.mensajes) : [],
+      conjuntos: r.conjuntos.map(c => (activa ? c : { ...c, columnas: [], numericas: [], anchos: [] })),
+    }
+  }
+  const esquemas: Record<string, Esquema> = {}
+  for (const [id, e] of Object.entries(m.esquemas)) {
+    const objetos: Esquema['objetos'] = {}
+    const totales: NonNullable<Esquema['totales']> = {}
+    for (const [base, lista] of Object.entries(e.objetos)) {
+      if (!Array.isArray(lista)) {
+        objetos[base] = lista
+        continue
+      }
+      const cuenta = { table: 0, view: 0, proc: 0 } as Record<Objeto['kind'], number>
+      objetos[base] = lista.filter(o => ++cuenta[o.kind] <= MAX_OBJETOS_TIPO)
+      if (objetos[base].length < lista.length) totales[base] = cuenta
+    }
+    esquemas[id] = { ...e, objetos, ...(Object.keys(totales).length ? { totales } : {}) }
+  }
+  const props: Modelo = { ...m, resultados, esquemas, vista: v }
+
+  const cj = resultados[v.pestana]?.estado === 'listo' ? resultados[v.pestana]!.conjuntos[v.conjunto] : undefined
+  const rs = completos.get(v.pestana)?.[v.conjunto]
+  if (!cj || !rs || rs.filas.length === 0) return props
+  const base = pesa(props)
+  let caracteres = TOPE_CARACTERES - base.caracteres
+  let cuantos = TOPE_VALORES - base.valores
+  const col0 = Math.max(0, Math.min(v.col, rs.columnas.length - 1))
+  const col1 = Math.min(rs.columnas.length, col0 + MAX_COLUMNAS_VENTANA)
+  const desde = Math.max(0, Math.min(v.desde, rs.filas.length - 1))
+  const cabe = (i: number) => {
+    const f = rs.filas[i]!.slice(col0, col1).map(aTexto)
+    const c = JSON.stringify(f).length + 1
+    if (c > caracteres || f.length + 1 > cuantos) return null
+    caracteres -= c
+    cuantos -= f.length + 1
+    return f
+  }
+  const filas: (string | null)[][] = []
+  for (let i = desde; i < rs.filas.length && i < desde + FILAS_ADELANTE; i++) {
+    const f = cabe(i)
+    if (!f) break
+    filas.push(f)
+  }
+  let primera = desde
+  for (let i = desde - 1; i >= 0 && i >= desde - FILAS_ATRAS; i--) {
+    const f = cabe(i)
+    if (!f) break
+    filas.unshift(f)
+    primera = i
+  }
+  const conjunto: Conjunto = { ...cj, filas, desde: primera, col0 }
+  return { ...props, resultados: { ...resultados, [v.pestana]: { ...resultados[v.pestana]!, conjuntos: resultados[v.pestana]!.conjuntos.map((c, i) => (i === v.conjunto ? conjunto : c)) } } }
+}
+
+/** Si aun así no cabe: solo lo indispensable y un aviso legible en vez de un panel vacío. */
+function minimo(p: Modelo): Modelo {
+  const resultados = Object.fromEntries(
+    Object.entries(p.resultados).map(([id, r]) => [id, { ...r, error: r.error?.slice(0, 200), mensajes: [], conjuntos: r.conjuntos.map(c => ({ ...c, columnas: [], numericas: [], anchos: [], filas: [] })) }]),
+  )
+  const esquemas = Object.fromEntries(Object.entries(p.esquemas).map(([id, e]) => [id, { ...e, objetos: {}, totales: undefined }]))
+  const encargo = p.encargo && p.encargo.pestana.sql.length < 20_000 ? p.encargo : null
+  return { ...p, resultados, esquemas, encargo, pegado: p.pegado && p.pegado.texto.length < 20_000 ? p.pegado : null, aviso: 'El resultado es demasiado grande para mostrarlo aquí: usa Copiar o CSV, o pide menos columnas.' }
+}
+
+const caben = (p: Modelo) => {
+  const x = pesa(p)
+  return x.caracteres <= 95_000 && x.valores <= 19_000
+}
+
 /** Ejecuta la consulta de una pestaña; `soloLectura` la obliga aunque la conexión no lo sea. */
 async function ejecutar($: EngineInterface, p: Extract<Pedido, { t: 'ejecutar' }>, soloLectura = false): Promise<void> {
   const m = await read($, modelo)
   const conexion = m.conexiones.find(c => c.id === p.conexion)
   if (!conexion) return
   const corriendo: Resultado = { estado: 'corriendo', conexion: p.conexion, base: p.base, conjuntos: [], mensajes: [] }
-  await update($, modelo, x => ({ ...x, resultados: { ...x.resultados, [p.pestana]: corriendo } }))
+  await update($, modelo, x => ({ ...x, aviso: null, resultados: { ...x.resultados, [p.pestana]: corriendo } }))
+  await update($, fallas, () => ({ n: 0, motivo: '' }))
   let fin: Resultado
   try {
     const r = await puente<PuenteResultado>($, '/query', {
@@ -180,24 +287,36 @@ async function ejecutar($: EngineInterface, p: Extract<Pedido, { t: 'ejecutar' }
       conn: alPuente(soloLectura ? { ...conexion, soloLectura: true } : conexion),
       database: p.base,
       sql: p.sql,
-      maxRows: 5000,
+      maxRows: MAX_FILAS,
     })
-    completos.set(p.pestana, r.results.map(rs => ({ columnas: rs.columns, filas: rs.rows })))
     fin = {
       estado: 'listo',
       conexion: p.conexion,
       base: p.base,
       ms: r.ms,
       fallo: r.failed,
+      // Las filas se quedan en `completos`: al panel viaja solo la ventana a la vista.
       conjuntos: r.results.map(rs => ({
         columnas: rs.columns,
         numericas: rs.columns.map((_, i) => NUMERICOS.test(rs.types?.[i] ?? '') || (rs.rows.length > 0 && rs.rows.every(f => f[i] === null || typeof f[i] === 'number'))),
-        filas: rs.rows.slice(0, MAX_FILAS_PANEL).map(f => f.map(aTexto)),
+        anchos: rs.columns.map((c, i) => Math.min(MAX_ANCHO_COLUMNA, rs.rows.reduce((a, f) => Math.max(a, (aTexto(f[i]) ?? 'NULL').length + 2), Math.max(c.length + 2, 6)))),
+        filas: [],
+        desde: 0,
+        col0: 0,
         total: rs.rows.length,
-        recortado: rs.truncated || rs.rows.length > MAX_FILAS_PANEL,
+        recortado: rs.truncated,
       })),
       mensajes: r.messages.map(x => ({ texto: x.text, ...(x.error ? { error: true } : {}) })),
     }
+    // La pestaña se cerró mientras corría: nada que guardar.
+    if (vivas && !vivas.has(p.pestana) && !p.pestana.startsWith('claude-')) {
+      await update($, modelo, x => {
+        const { [p.pestana]: _cerrada, ...resultados } = x.resultados
+        return { ...x, resultados }
+      })
+      return
+    }
+    completos.set(p.pestana, r.results.map(rs => ({ columnas: rs.columns, filas: rs.rows })))
   } catch (err) {
     fin = { estado: 'listo', conexion: p.conexion, base: p.base, fallo: true, error: mensaje(err), conjuntos: [], mensajes: [{ texto: mensaje(err), error: true }] }
   }
@@ -221,6 +340,7 @@ async function cargarEsquema($: EngineInterface, idConexion: string, base?: stri
     return
   }
   await poner(e => ({ ...e, objetos: { ...e.objetos, [base]: 'cargando' } }))
+  // (al panel viajan a lo sumo MAX_OBJETOS_TIPO de cada tipo: ver paraPanel)
   try {
     const r = await puente<{ objects: Esquema['objetos'][string] }>($, '/schema', { conn: alPuente(conexion), database: base })
     await poner(e => ({ ...e, objetos: { ...e.objetos, [base]: r.objects } }))
@@ -340,9 +460,15 @@ async function atender($: EngineInterface, p: Pedido, superficie: 'terminal' | s
         $.ui.toast('No pude leer el portapapeles. Pega con Ctrl+Shift+V (el pegado de la terminal).')
         return
       }
+      if (texto.length > MAX_PEGADO) {
+        $.ui.toast(`El portapapeles tiene ${texto.length.toLocaleString('es')} caracteres; el panel pega hasta ${MAX_PEGADO.toLocaleString('es')}.`)
+        return
+      }
       await update($, modelo, m => ({ ...m, pegado: { n: (m.pegado?.n ?? 0) + 1, texto } }))
       return
     }
+    case 'ver':
+      return // la vista ya se aplicó al llegar el pedido
     case 'ampliar': {
       const m = await update($, modelo, x => ({ ...x, ampliado: !x.ampliado }))
       await abrir($, false, m.ampliado)
@@ -366,6 +492,27 @@ async function atender($: EngineInterface, p: Pedido, superficie: 'terminal' | s
       return
     }
   }
+}
+
+/** Lo que el panel mira y tiene abierto: cambia qué filas viajan y borra lo de las pestañas cerradas. */
+async function verVista($: EngineInterface, v: Vista): Promise<void> {
+  const antes = await read($, vista)
+  if (JSON.stringify(antes) === JSON.stringify(v)) return
+  const abiertas = new Set(v.pestanas)
+  vivas = abiertas
+  if (antes.pestanas?.join('|') !== v.pestanas.join('|') || (v.pegado > 0 && antes.pegado !== v.pegado)) {
+    await update($, modelo, m => {
+      const deClaude = m.encargo?.pestana.id
+      const quedan = Object.entries(m.resultados).filter(([id]) => abiertas.has(id) || id === deClaude)
+      // El pegado ya está en el editor: no hace falta que siga viajando en cada dibujo.
+      const pegado = m.pegado && m.pegado.n <= v.pegado && m.pegado.texto ? { n: m.pegado.n, texto: '' } : m.pegado
+      if (quedan.length === Object.keys(m.resultados).length && pegado === m.pegado) return m
+      return { ...m, pegado, resultados: Object.fromEntries(quedan) }
+    })
+    const deClaude = (await read($, modelo)).encargo?.pestana.id
+    for (const id of [...completos.keys()]) if (!abiertas.has(id) && id !== deClaude) completos.delete(id)
+  }
+  await update($, vista, () => v)
 }
 
 // ── Consultas que pide Claude: se abren en el panel y corren a la vista
@@ -481,7 +628,7 @@ export const register: Register = on => {
           base: { type: 'string', description: 'Base de datos donde corre; vacío = la predeterminada de la conexión.' },
           sql: { type: 'string', description: 'La consulta, de solo lectura.' },
           titulo: { type: 'string', description: 'Nombre corto de la pestaña, p. ej. «ventas-octubre».' },
-          filas: { type: 'integer', minimum: 1, maximum: 1000, description: `Máximo de filas por conjunto en la respuesta (por defecto ${FILAS_CLAUDE}); el panel muestra hasta ${MAX_FILAS_PANEL}.` },
+          filas: { type: 'integer', minimum: 1, maximum: 1000, description: `Máximo de filas por conjunto en la respuesta (por defecto ${FILAS_CLAUDE}); en el panel se recorren hasta ${MAX_FILAS}.` },
         },
         required: ['conexion', 'sql'],
       },
@@ -502,6 +649,7 @@ export const register: Register = on => {
       return { text: 'Estudio SQL cerrado.' }
     }
     void arrancarPuente($).catch(() => undefined)
+    await update($, fallas, () => ({ n: 0, motivo: '' }))
     const puesto = await abrir($, true, (await read($, modelo)).ampliado)
     return { text: puesto ? 'Estudio SQL abierto.' : 'Estudio SQL se abrirá cuando la terminal tenga más espacio (pantalla completa, 110 columnas o más).' }
   })
@@ -512,14 +660,31 @@ export const register: Register = on => {
     const { Client } = els
     if (e.viewport && e.viewport.columns > 0) columnasTerminal = e.viewport.columns
     const m = await read($, modelo)
+    const v = await read($, vista)
+    const f = await read($, fallas)
+    // Falló dos veces seguidas: un aviso legible en vez de insistir con un panel que el motor descarta.
+    if (f.n >= 2) return <els.Text color="yellow">{`Estudio SQL no pudo dibujarse: ${f.motivo}\nCierra y vuelve a abrir /sql para reintentar.`}</els.Text>
+    let props = paraPanel(m, v)
+    if (!caben(props)) props = minimo(props)
+    if (!caben(props)) return <els.Text color="yellow">Estudio SQL tiene demasiado para dibujar. Cierra pestañas o vuelve a abrir /sql.</els.Text>
     // El tamaño exacto del cuerpo del panel: así el dibujo lo llena entero.
     const filas = Math.max(12, e.props.scroll?.bodyRows ?? 30)
     const columnas = Math.max(40, e.props.bodyColumns || 100)
-    return <Client key="estudio" module="./estudio.tsx" props={m} width={columnas} height={filas} />
+    return <Client key="estudio" module="./estudio.tsx" props={props} width={columnas} height={filas} />
+  })
+
+  // El motor descartó el panel: se cuenta y se dice por qué (si no, queda vacío sin explicación).
+  on('ui.fault', async ($, e, next) => {
+    if (e.requestId === PANEL) {
+      await update($, fallas, x => ({ n: x.n + 1, motivo: e.reason }))
+      await update($, modelo, m => ({ ...m, aviso: `El panel falló y se volvió a abrir: ${e.reason}` }))
+    }
+    return next(e)
   })
 
   on('ui.message', { requestId: PANEL }, async ($, e) => {
-    const p = e.data as Pedido
+    const p = e.data as Pedido & { vista?: Vista }
+    if (p && typeof p === 'object' && p.vista) await verVista($, p.vista)
     if (p && typeof p === 'object' && 't' in p) void atender($, p, e.surface).catch(async err => {
       await update($, modelo, m => ({ ...m, aviso: mensaje(err) }))
     })

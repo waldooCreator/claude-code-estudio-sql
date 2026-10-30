@@ -37,8 +37,9 @@ export class Lienzo {
       const fila = this.celdas[y]
       if (fila && x >= 0 && x < this.cols) {
         const c = fila[x]!
-        // Un tabulador o un \r (pegados, o dentro de una celda) correrían la cuadrícula.
-        c.c = ch < ' ' || ch === '\x7f' ? ' ' : ch
+        // Un tabulador o un \r (pegados, o dentro de una celda) correrían la cuadrícula,
+        // y un carácter de control C1 (U+0080–U+009F, texto mal convertido) tumba el panel.
+        c.c = ch < ' ' || (ch >= '\x7f' && ch <= '\x9f') ? ' ' : ch
         if (f) c.f = f
         if (b) c.b = b
         c.bold = bold
@@ -72,18 +73,52 @@ export class Lienzo {
     }
     return undefined
   }
-  /** Cada fila como tramos de un mismo estilo, listos para Text. */
-  tramos(): { s: string; f: string; b: string; bold: boolean }[][] {
+  /**
+   * Cada fila como tramos de un mismo estilo, listos para Text. El motor no
+   * acepta un dibujo de más de 100 000 caracteres, y cada tramo pesa: un espacio
+   * no muestra su color de letra, así que se suma al tramo vecino del mismo fondo.
+   * `nivel` 1 junta también letras de distinto color; 2 deja un tramo por fila.
+   */
+  tramos(nivel: 0 | 1 | 2 = 0): Tramo[][] {
     return this.celdas.map(fila => {
-      const out: { s: string; f: string; b: string; bold: boolean }[] = []
+      if (nivel === 2) return [{ s: fila.map(c => c.c).join(''), f: fila.find(c => c.c !== ' ')?.f ?? fila[0]!.f, b: fila[0]!.b, bold: false }]
+      const out: (Tramo & { blanco: boolean })[] = []
       for (const c of fila) {
         const last = out[out.length - 1]
-        if (last && last.f === c.f && last.b === c.b && last.bold === c.bold) last.s += c.c
-        else out.push({ s: c.c, f: c.f, b: c.b, bold: c.bold })
+        if (last && last.b === c.b) {
+          if (c.c === ' ' || nivel === 1 || (last.f === c.f && last.bold === c.bold)) {
+            last.s += c.c
+            if (c.c !== ' ') last.blanco = false
+            continue
+          }
+          // El tramo anterior es solo espacios: toma el estilo de esta letra.
+          if (last.blanco) {
+            last.s += c.c
+            last.f = c.f
+            last.bold = c.bold
+            last.blanco = false
+            continue
+          }
+        }
+        out.push({ s: c.c, f: c.f, b: c.b, bold: c.bold, blanco: c.c === ' ' })
       }
       return out
     })
   }
+}
+
+export type Tramo = { s: string; f: string; b: string; bold: boolean }
+
+/** Lo que pesa un dibujo para el motor (de más) y cuántos elementos tiene. */
+export function pesoDibujo(filas: Tramo[][]): { caracteres: number; nodos: number } {
+  let caracteres = 0
+  let nodos = 0
+  for (const fila of filas) {
+    caracteres += 60
+    nodos += 1 + fila.length
+    for (const t of fila) caracteres += JSON.stringify(t.s).length + 90
+  }
+  return { caracteres, nodos }
 }
 
 export const recortar = (s: string, n: number): string =>
@@ -106,35 +141,53 @@ const FUNCIONES = new Set(
 
 export type Token = [texto: string, color: string]
 
-/** Parte una línea en tramos coloreados. `enComentario` sigue un /* abierto. */
-export function colorear(linea: string, t: Tema, enComentario = false): { tokens: Token[]; sigue: boolean } {
+// Expresiones «pegajosas» (y): buscan justo en lastIndex, sin copiar el resto de
+// la línea en cada paso (con líneas larguísimas eso era cuadrático).
+const CADENA = /N?'(?:[^']|'')*'?/y
+const CITA = /\[[^\]]*\]?|"[^"]*"?|`[^`]*`?/y
+const NUMERO = /\d+(\.\d+)?/y
+const NOMBRE = /[@#]{0,2}[A-Za-z_][\w$]*/y
+const OPERADOR = /[(),;*=<>!+\-/%.]+/y
+
+function en(re: RegExp, s: string, i: number): string | null {
+  re.lastIndex = i
+  return re.exec(s)?.[0] ?? null
+}
+
+/**
+ * Parte una línea en tramos coloreados. `enComentario` sigue un /* abierto;
+ * con `soloEstado` no arma los tramos (las líneas que no se ven solo dicen eso).
+ */
+export function colorear(linea: string, t: Tema, enComentario = false, soloEstado = false): { tokens: Token[]; sigue: boolean } {
   const out: Token[] = []
+  const poner = (s: string, c: string) => { if (!soloEstado) out.push([s, c]) }
   let i = 0
   let comentario = enComentario
+  let m: string | null
   while (i < linea.length) {
-    const r = linea.slice(i)
     if (comentario) {
-      const fin = r.indexOf('*/')
-      const s = fin < 0 ? r : r.slice(0, fin + 2)
-      out.push([s, t.com])
+      const fin = linea.indexOf('*/', i)
+      const s = fin < 0 ? linea.slice(i) : linea.slice(i, fin + 2)
+      poner(s, t.com)
       i += s.length
       comentario = fin < 0
       continue
     }
-    let m: RegExpMatchArray | null
-    if (r.startsWith('--')) { out.push([r, t.com]); break }
-    if (r.startsWith('/*')) { comentario = true; continue }
-    if ((m = r.match(/^N?'(?:[^']|'')*'?/))) { out.push([m[0], t.str]); i += m[0].length; continue }
-    if ((m = r.match(/^\[[^\]]*\]?|^"[^"]*"?|^`[^`]*`?/))) { out.push([m[0], t.texto]); i += m[0].length; continue }
-    if ((m = r.match(/^\d+(\.\d+)?/))) { out.push([m[0], t.num]); i += m[0].length; continue }
-    if ((m = r.match(/^[@#]{0,2}[A-Za-z_][\w$]*/))) {
-      const u = m[0].toUpperCase()
-      out.push([m[0], PALABRAS.has(u) ? t.kw : FUNCIONES.has(u) ? t.fn : t.texto])
-      i += m[0].length
+    if (linea.startsWith('--', i)) { poner(linea.slice(i), t.com); break }
+    if (linea.startsWith('/*', i)) { comentario = true; continue }
+    if ((m = en(CADENA, linea, i))) { poner(m, t.str); i += m.length; continue }
+    if ((m = en(CITA, linea, i))) { poner(m, t.texto); i += m.length; continue }
+    if ((m = en(NUMERO, linea, i))) { poner(m, t.num); i += m.length; continue }
+    if ((m = en(NOMBRE, linea, i))) {
+      if (!soloEstado) {
+        const u = m.toUpperCase()
+        poner(m, PALABRAS.has(u) ? t.kw : FUNCIONES.has(u) ? t.fn : t.texto)
+      }
+      i += m.length
       continue
     }
-    if ((m = r.match(/^[(),;*=<>!+\-/%.]+/))) { out.push([m[0], t.op]); i += m[0].length; continue }
-    out.push([r[0]!, t.texto])
+    if ((m = en(OPERADOR, linea, i))) { poner(m, t.op); i += m.length; continue }
+    poner(linea[i]!, t.texto)
     i++
   }
   return { tokens: out, sigue: comentario }

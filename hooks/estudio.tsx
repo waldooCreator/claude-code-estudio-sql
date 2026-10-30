@@ -1,8 +1,18 @@
 import type { ClientKeyEvent, ClientPointerEvent, ClientSurface } from 'claude-code'
 
-import type { Conexion, Modelo, Motor, Objeto, Pedido } from '../types'
-import { CLARO, Lienzo, OSCURO, colorear, recortar } from './dibujo'
+import type { Conexion, Modelo, Motor, Objeto, Pedido, Vista } from '../types'
+import { CLARO, Lienzo, OSCURO, colorear, pesoDibujo, recortar } from './dibujo'
 import type { Tema } from './dibujo'
+
+// La vista que el panel quiere y la que el mod ya acusó (vuelve en las props).
+// El motor entrega un solo pedido por cuadro: la vista viaja en cada pedido y,
+// si no hubo ninguno, la manda un reloj, sin chocar con los clics.
+let vistaQuerida: Vista | null = null
+let vistaAcusada = ''
+/** Salió un pedido desde el último tic del reloj: la vista espera al siguiente. */
+let pedidoReciente = false
+/** Un pedido más grande que esto no llega al mod (el motor no lo envía). */
+const MAX_PEDIDO = 90_000
 
 type Pos = { r: number; c: number }
 /** `ancla`: el otro extremo de la selección, si hay una. */
@@ -66,6 +76,8 @@ type Estado = {
   /** Ancho del explorador y alto del editor elegidos al arrastrar; null = automático. */
   anchoExp: number | null
   altoEditor: number | null
+  /** Un aviso del propio panel (p. ej. un texto demasiado largo para enviarlo). */
+  nota: string | null
 }
 
 const MOTORES: [Motor, string, string][] = [
@@ -96,7 +108,8 @@ const ICONO_BASE =[' ▄▄▄▄ ', '█▄▄▄▄█', '█▄▄▄▄█',
 function inicial(m: Modelo): Estado {
   const c = m.conexiones[0]
   return {
-    pestanas: [{ id: 'q1', nombre: 'consulta1.sql', conexion: c?.id ?? '', base: c?.base ?? '', sql: '', cur: { r: 0, c: 0 } }],
+    // Un id nuevo cada vez: al reabrir /sql no hereda el resultado de la pestaña de antes.
+    pestanas: [{ id: 'q1-' + Date.now(), nombre: 'consulta1.sql', conexion: c?.id ?? '', base: c?.base ?? '', sql: '', cur: { r: 0, c: 0 } }],
     pestana: 0,
     abiertos: {},
     sel: null,
@@ -118,6 +131,7 @@ function inicial(m: Modelo): Estado {
     arrastre: null,
     anchoExp: null,
     altoEditor: null,
+    nota: null,
   }
 }
 
@@ -148,8 +162,29 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
       if (s && (s.foco === 'editor' || s.dlg)) surface.setState({ ...s, parpadeo: !s.parpadeo })
     })
     surface.setState(inicial(m))
+    pedidoReciente = false
+    surface.every(25, () => {
+      if (pedidoReciente) {
+        pedidoReciente = false
+        return
+      }
+      if (!vistaQuerida || JSON.stringify(vistaQuerida) === vistaAcusada) return
+      pedidoReciente = true
+      surface.post({ t: 'ver', vista: vistaQuerida })
+    })
   }
   const S: Estado = surface.state ?? inicial(m)
+  /** Le pide algo al mod; lo que pasa del tope no se envía y se avisa. */
+  const pedir = (p: Pedido): boolean => {
+    const envio = { ...p, vista: vistaQuerida }
+    if (JSON.stringify(envio).length > MAX_PEDIDO) {
+      surface.setState({ ...(surface.state ?? S), nota: `Es demasiado texto para enviarlo desde el panel (más de ${MAX_PEDIDO.toLocaleString('es')} caracteres).` })
+      return false
+    }
+    pedidoReciente = true
+    surface.post(envio)
+    return true
+  }
   // Llegó lo leído del portapapeles (Ctrl+V): va al campo de la ventana o al editor.
   if (surface.state && m.pegado && m.pegado.n !== S.pegadoN) {
     const texto = m.pegado.texto
@@ -183,18 +218,28 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
     fn(nuevo)
     surface.setState(nuevo)
   }
-  const pedir = (p: Pedido) => surface.post(p)
 
   const tab = S.pestanas[S.pestana] ?? S.pestanas[0]!
   const conexion = m.conexiones.find(c => c.id === tab.conexion) ?? m.conexiones[0]
   const res = m.resultados[tab.id]
   const corriendo = res?.estado === 'corriendo'
 
+  // Al mod le llega solo lo que se mira: qué filas traer y qué pestañas siguen abiertas.
+  const ahora = surface.state ?? S
+  const enFoco = ahora.pestanas[ahora.pestana] ?? ahora.pestanas[0]!
+  vistaQuerida = { pestana: enFoco.id, conjunto: ahora.conjunto, desde: ahora.desdeFila, col: ahora.desdeCol, pestanas: ahora.pestanas.map(p => p.id), pegado: ahora.pegadoN }
+  vistaAcusada = JSON.stringify(m.vista ?? null)
+  // Si en este cuadro no salió otro pedido, va ya; si no, la manda el reloj.
+  if (JSON.stringify(vistaQuerida) !== vistaAcusada && !pedidoReciente) {
+    pedidoReciente = true
+    surface.post({ t: 'ver', vista: vistaQuerida })
+  }
+
   const ejecutar = () => {
     if (!conexion || corriendo) return
     if (!tab.sql.trim()) return
-    pedir({ t: 'ejecutar', pestana: tab.id, conexion: conexion.id, base: tab.base || conexion.base, sql: tab.sql })
-    cambiar(s => { s.vista = 'res'; s.conjunto = 0; s.fila = null; s.desdeFila = 0; s.desdeCol = 0 })
+    if (!pedir({ t: 'ejecutar', pestana: tab.id, conexion: conexion.id, base: tab.base || conexion.base, sql: tab.sql })) return
+    cambiar(s => { s.vista = 'res'; s.conjunto = 0; s.fila = null; s.desdeFila = 0; s.desdeCol = 0; s.nota = null })
   }
   const nuevaPestana = (sql = '', con = conexion, base?: string, nombre?: string) => {
     cambiar(s => {
@@ -331,11 +376,14 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
             if (!Array.isArray(objs)) return aviso(2, '✗ ' + objs.error, T.error)
             for (const [tipo, etiqueta] of [['table', 'Tablas'], ['view', 'Vistas'], ['proc', 'Procedimientos']] as const) {
               const lista = objs.filter(o => o.kind === tipo)
-              nodo(2, `${c.id}/b/${b}/${tipo}`, etiqueta, `${lista.length}`, '▪', T.tenue, () => {
+              // Una base con miles de objetos no viaja entera: se dice cuántos faltan.
+              const total = e.totales?.[b]?.[tipo] ?? lista.length
+              nodo(2, `${c.id}/b/${b}/${tipo}`, etiqueta, `${total}`, '▪', T.tenue, () => {
                 for (const o of lista) {
                   const nombre = o.schema ? `${o.schema}.${o.name}` : o.name
                   nodo(3, `${c.id}/b/${b}/${tipo}/${nombre}`, nombre, '', tipo === 'proc' ? 'ƒ' : '▦', T.texto, null)
                 }
+                if (total > lista.length) aviso(3, `… y ${total - lista.length} más (escríbelas en una consulta)`, T.tenue)
               }, undefined)
             }
           }, () => {
@@ -398,8 +446,9 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
   const anchoNum = 4
   const desdeX = Math.max(0, cur.c - (QW - anchoNum - 4))
   L.zona(QX, ED, QW, EL, 'editor', () => {})
+  // Las líneas de arriba no se dibujan: solo importa si dejan un /* abierto.
   let enComentario = false
-  for (let i = 0; i < arriba; i++) enComentario = colorear(lineas[i]!, T, enComentario).sigue
+  for (let i = 0; i < arriba; i++) enComentario = colorear(lineas[i]!, T, enComentario, true).sigue
   const sel = seleccion(tab)
   let offLinea = aOffset(lineas, { r: arriba, c: 0 })
   for (let k = 0; k < EL - 1; k++) {
@@ -493,9 +542,11 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
     const cj = conjuntos[S.conjunto]
     if (!res) L.put(QX + 2, GY + 1, conexion ? 'Ejecuta la consulta (Ctrl+E, F5 o el botón ▶) para ver los resultados aquí.' : 'Elige o crea una conexión para empezar.', T.tenue)
     else if (!cj) L.put(QX + 2, GY + 1, hayError ? 'La consulta no devolvió resultados. Revisa la pestaña Mensajes.' : 'La consulta no devolvió filas. Revisa la pestaña Mensajes.', T.tenue)
+    // Recién se cambió de pestaña: sus columnas y filas llegan en el próximo dibujo.
+    else if (cj.columnas.length === 0 && cj.total > 0) L.put(QX + 2, GY + 1, '⠿ Cargando filas…', T.tenue)
     else {
-      const anchos = cj.columnas.map((c, i) => Math.min(40, Math.max(c.length + 2, 6, ...cj.filas.slice(0, 200).map(f => (f[i] ?? 'NULL').length + 2))))
-      const numW = String(cj.filas.length).length + 1
+      const anchos = cj.anchos
+      const numW = String(cj.total).length + 1
       L.fill(QX, GY, QW, 1, T.cabecera)
       let cx = QX + numW + 1
       for (let i = S.desdeCol; i < cj.columnas.length && cx < QX + QW; i++) {
@@ -514,26 +565,38 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
       columnaEn = (x: number) => bordes.find(b => x >= b.x0 && x < b.x1)?.c ?? null
       for (let k = 0; k < visibles; k++) {
         const i = S.desdeFila + k
-        const f = cj.filas[i]
-        if (!f) break
+        if (i >= cj.total) break
+        // Las filas llegan por ventanas: `desde` es la primera que trae este dibujo.
+        const f = cj.filas[i - cj.desde]
         const y = GY + 1 + k
         const fondo = S.fila === i ? T.sel : i % 2 ? T.cebra : T.fondo
         const h = L.zona(QX, y, QW, 1, 'fila' + i, () => cambiar(s => { s.fila = i; s.foco = 'resultados' }))
         L.fill(QX, y, QW, 1, h && S.fila !== i ? T.hover : fondo)
         L.put(QX, y, String(i + 1).padStart(numW) + ' ', T.tenue, T.cabecera)
+        if (!f) {
+          L.put(QX + numW + 2, y, '⠿', T.tenue)
+          continue
+        }
         let x = QX + numW + 1
-        for (let c = S.desdeCol; c < f.length && x < QX + QW; c++) {
+        for (let c = S.desdeCol; c < cj.columnas.length && x < QX + QW; c++) {
           const w = Math.min(anchos[c]!, QX + QW - x)
-          const v = f[c]
+          const j = c - cj.col0
+          // Una columna que esta ventana no trae: queda en blanco hasta el próximo dibujo.
+          if (j < 0 || j >= f.length) {
+            x += anchos[c]!
+            continue
+          }
+          const v = f[j]
           const enCelda = S.celda?.f === i && S.celda.c === c
           if (enCelda) L.fill(x, y, w, 1, T.acento)
           if (v === null || v === undefined) L.put(x + 1, y, recortar('NULL', w - 2), enCelda ? '#ffffff' : T.tenue, enCelda ? T.acento : T.nulo)
-          else L.put(x + 1, y, cj.numericas[c] ? v.slice(0, w - 2).padStart(w - 2) : recortar(v, w - 2), enCelda ? '#ffffff' : T.texto)
+          // Un número que no cabe nunca se corta callado: lleva «…» como el texto.
+          else L.put(x + 1, y, cj.numericas[c] && v.length <= w - 2 ? v.padStart(w - 2) : recortar(v, w - 2), enCelda ? '#ffffff' : T.texto)
           x += anchos[c]!
         }
       }
       // desplazamiento
-      const total = cj.filas.length
+      const total = cj.total
       if (total > visibles || S.desdeCol > 0 || cx >= QX + QW) {
         let sx = QX + QW - 15
         sx = L.boton(sx, GY, '◀', T.texto, T.pestanaOff, T.pestanaHover, 'izq', () => cambiar(s => { s.desdeCol = Math.max(0, s.desdeCol - 1) }), false)
@@ -549,7 +612,8 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
   const mal = hayError && !corriendo
   L.fill(0, SY, W, 1, mal ? T.estadoError : T.estado)
   const bajoPuntero = S.hover ? (cortados[S.hover] ?? AYUDAS[S.hover]) : undefined
-  if (bajoPuntero && !S.arrastre) L.put(1, SY, recortar(bajoPuntero, W - 50), T.texto)
+  if (S.nota) L.put(1, SY, recortar('⚠ ' + S.nota, W - 50), T.error)
+  else if (bajoPuntero && !S.arrastre) L.put(1, SY, recortar(bajoPuntero, W - 50), T.texto)
   else if (S.arrastre) L.put(1, SY, S.arrastre === 'v' ? `Explorador: ${EW} columnas` : `Consulta: ${EL - 1} líneas · resultados: ${H - ED - EL - 3} filas`, T.acento, undefined, true)
   else if (corriendo) L.put(1, SY, '⠿ Ejecutando…', T.tenue, undefined, true)
   else if (mal) L.put(1, SY, '✗ La consulta terminó con errores', T.error, undefined, true)
@@ -723,6 +787,7 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
     const conTab = (fn: (p: Pestana) => Pestana) => S.pestanas.map((p, i) => (i === S.pestana ? fn(p) : p))
     surface.onPointer((ev: ClientPointerEvent) => {
       const z = L.zonaEn(ev.x, ev.y)
+      if (ev.type === 'down' && S.nota) S.nota = null
       // Arrastrar un divisor: el explorador cambia de ancho o el editor de alto.
       if (S.arrastre && ev.type === 'move') {
         if (S.arrastre === 'v') {
@@ -788,14 +853,24 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
         z.accion()
       } else if (S.foco) surface.setState({ ...S, foco: null })
     })
-    surface.onKey((ev: ClientKeyEvent) => teclas(ev))
-    const filas = L.tramos()
+    surface.onKey((ev: ClientKeyEvent) => {
+      if (S.nota) S.nota = null
+      teclas(ev)
+    })
+    // El motor desmonta un dibujo de más de 100 000 caracteres o 20 000 elementos:
+    // si este pasara, se dibuja con menos colores antes que quedar en blanco.
+    let filas = L.tramos()
+    for (const nivel of [1, 2] as const) {
+      const peso = pesoDibujo(filas)
+      if (peso.caracteres <= 85_000 && peso.nodos <= 15_000) break
+      filas = L.tramos(nivel)
+    }
     return (
       <Box flexDirection="column" width={W} height={H}>
         {filas.map(fila => (
           <Text wrap="truncate-end">
             {fila.map(t => (
-              <Text color={t.f} backgroundColor={t.b} bold={t.bold}>
+              <Text color={t.f} backgroundColor={t.b} {...(t.bold ? { bold: true } : {})}>
                 {t.s}
               </Text>
             ))}
@@ -870,7 +945,7 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
       const cj = conjuntos[S.conjunto]
       if (!cj) return
       const paso = Math.max(1, H - (ED + EL) - 3)
-      const max = Math.max(0, cj.filas.length - 1)
+      const max = Math.max(0, cj.total - 1)
       const f = S.fila ?? S.desdeFila
       let nf = f
       if (k === 'down') nf = Math.min(max, f + 1)

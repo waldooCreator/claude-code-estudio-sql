@@ -21,6 +21,8 @@ export type Esquema = {
   error?: string
   bases?: string[]
   objetos: Record<string, Objeto[] | 'cargando' | { error: string }>
+  /** Bases con más objetos de los que viajan al panel: cuántos hay de cada tipo. */
+  totales?: Record<string, Record<Objeto['kind'], number>>
 }
 
 export type Resultado = {
@@ -30,9 +32,33 @@ export type Resultado = {
   ms?: number
   fallo?: boolean
   error?: string
-  conjuntos: { columnas: string[]; numericas: boolean[]; filas: (string | null)[][]; total: number; recortado: boolean }[]
+  conjuntos: Conjunto[]
   mensajes: { texto: string; error?: boolean }[]
 }
+
+/**
+ * Un conjunto de resultados. Al panel solo viaja la ventana que está a la vista:
+ * las filas desde `desde` y, de cada una, las columnas desde `col0`. El resto
+ * se queda en el mod (para copiar y para Claude) y llega al desplazarse.
+ */
+export type Conjunto = {
+  columnas: string[]
+  numericas: boolean[]
+  /** Ancho de cada columna en celdas, medido sobre todas las filas. */
+  anchos: number[]
+  filas: (string | null)[][]
+  desde: number
+  col0: number
+  total: number
+  recortado: boolean
+}
+
+/**
+ * Lo que el panel le cuenta al mod (y el mod le devuelve en las props como acuse):
+ * qué mira (de esa pestaña y ese conjunto viajan las filas), qué pestañas siguen
+ * abiertas (las demás se borran) y el último pegado que ya insertó.
+ */
+export type Vista = { pestana: string; conjunto: number; desde: number; col: number; pestanas: string[]; pegado: number }
 
 export type Prueba = { estado: 'probando' | 'ok' | 'error'; texto: string }
 
@@ -50,6 +76,8 @@ export type Modelo = {
   pegado: { n: number; texto: string } | null
   /** La última consulta que pidió Claude: el panel la abre en una pestaña; `n` cambia con cada una. */
   encargo: { n: number; pestana: Encargo } | null
+  /** La ventana de filas que trae este dibujo (solo en las props del panel). */
+  vista?: Vista
 }
 
 /** Una consulta que Claude ejecuta a la vista: la pestaña que el panel abre para ella. */
@@ -71,9 +99,11 @@ export type Pedido =
   | { t: 'copiarParte'; pestana: string; conjunto: number; fila: number | null; columna: number | null }
   | { t: 'pegar' }
   | { t: 'ampliar' }
+  /** Solo la vista; cualquier otro pedido también la lleva (el motor entrega un pedido por cuadro). */
+  | { t: 'ver' }
 
 declare module 'claude-code' {
   interface PluginState {
-    'estudio-sql': { modelo: Modelo }
+    'estudio-sql': { modelo: Modelo; vista: Vista; fallas: { n: number; motivo: string } }
   }
 }
