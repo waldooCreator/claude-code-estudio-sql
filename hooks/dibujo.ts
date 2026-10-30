@@ -37,7 +37,8 @@ export class Lienzo {
       const fila = this.celdas[y]
       if (fila && x >= 0 && x < this.cols) {
         const c = fila[x]!
-        c.c = ch
+        // Un tabulador o un \r (pegados, o dentro de una celda) correrían la cuadrícula.
+        c.c = ch < ' ' || ch === '\x7f' ? ' ' : ch
         if (f) c.f = f
         if (b) c.b = b
         c.bold = bold

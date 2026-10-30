@@ -954,6 +954,8 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
 }
 
 function envolver(texto: string, ancho: number): string[] {
+  // Con el panel angosto el ancho llega a 0 o menos: sin este piso el corte no avanza nunca.
+  ancho = Math.max(1, ancho)
   const out: string[] = []
   for (const linea of texto.split('\n')) {
     let resto = linea
