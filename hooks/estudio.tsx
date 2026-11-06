@@ -16,7 +16,8 @@ const MAX_PEDIDO = 90_000
 
 type Pos = { r: number; c: number }
 /** `ancla`: el otro extremo de la selección, si hay una. */
-type Pestana = { id: string; nombre: string; conexion: string; base: string; sql: string; cur: Pos; ancla?: Pos | null }
+/** `arriba`/`izq`: primera línea y columna a la vista; sin ellas el editor sigue al cursor. */
+type Pestana = { id: string; nombre: string; conexion: string; base: string; sql: string; cur: Pos; ancla?: Pos | null; arriba?: number; izq?: number }
 
 const aOffset = (lin: string[], p: Pos) => lin.slice(0, p.r).reduce((a, l) => a + l.length + 1, 0) + p.c
 function aPos(texto: string, off: number): Pos {
@@ -36,7 +37,7 @@ function insertar(p: Pestana, texto: string): Pestana {
   const lin = p.sql.split('\n')
   const [a, b] = seleccion(p) ?? [aOffset(lin, p.cur), aOffset(lin, p.cur)]
   const sql = p.sql.slice(0, a) + texto + p.sql.slice(b)
-  return { ...p, sql, cur: aPos(sql, a + texto.length), ancla: null }
+  return { ...p, sql, cur: aPos(sql, a + texto.length), ancla: null, arriba: undefined, izq: undefined }
 }
 type Dialogo = {
   id: string | null // null: conexión nueva
@@ -72,7 +73,7 @@ type Estado = {
   /** La última consulta de Claude ya abierta en una pestaña (Modelo.encargo.n). */
   encargoN: number
   /** Qué divisor se está arrastrando: el del explorador (v) o el de los resultados (h). */
-  arrastre: 'v' | 'h' | null
+  arrastre: 'v' | 'h' | { barra: string; agarre: number } | null
   /** Ancho del explorador y alto del editor elegidos al arrastrar; null = automático. */
   anchoExp: number | null
   altoEditor: number | null
@@ -432,6 +433,38 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
     tx += 1
   })
 
+  // ── Barras de desplazamiento: flechas en los extremos, clic en la pista para
+  // avanzar una página y el pulgar se arrastra. El panel no recibe la rueda del ratón.
+  type Barra = { id: string; x: number; y: number; largo: number; vertical: boolean; pos: number; max: number; frac: number; paso: number; pagina: number; mover: (n: number) => void }
+  const barras: Record<string, Barra & { pista: number; pulgar: number; desde: number }> = {}
+  const barra = (b: Barra) => {
+    if (b.largo < 4) return
+    const pista = b.largo - 2
+    const max = Math.max(0, b.max)
+    const pulgar = max === 0 ? pista : limitar(Math.round(pista * b.frac), 1, pista - 1)
+    const desde = max === 0 ? 0 : Math.round(((pista - pulgar) * limitar(b.pos, 0, max)) / max)
+    barras[b.id] = { ...b, max, pista, pulgar, desde }
+    const zona = (k: number, n: number, id: string, accion: () => void) =>
+      b.vertical ? L.zona(b.x, b.y + k, 1, n, id, accion) : L.zona(b.x + k, b.y, n, 1, id, accion)
+    const mover = (n: number) => b.mover(limitar(n, 0, max))
+    const hMenos = zona(0, 1, b.id + ':menos', () => mover(b.pos - b.paso))
+    const hMas = zona(b.largo - 1, 1, b.id + ':mas', () => mover(b.pos + b.paso))
+    zona(1, pista, b.id + ':pista', () => {})
+    const hPulgar = zona(1 + desde, pulgar, b.id + ':pulgar', () => {})
+    const activo = typeof S.arrastre === 'object' && S.arrastre?.barra === b.id
+    for (let k = 0; k < b.largo; k++) {
+      const x = b.vertical ? b.x : b.x + k
+      const y = b.vertical ? b.y + k : b.y
+      if (k === 0 || k === b.largo - 1) {
+        const h = k === 0 ? hMenos : hMas
+        L.put(x, y, k === 0 ? (b.vertical ? '▲' : '◀') : b.vertical ? '▼' : '▶', h ? T.acento : T.tenue, h ? T.pestanaHover : T.cabecera)
+      } else {
+        const enPulgar = k - 1 >= desde && k - 1 < desde + pulgar
+        L.put(x, y, ' ', T.texto, enPulgar ? (hPulgar || activo ? T.acento : T.sombra) : T.cabecera)
+      }
+    }
+  }
+
   // ── Editor
   const ED = EY + 1
   const espacio = H - ED - 2
@@ -442,9 +475,29 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
   const cur = tab.cur
   cur.r = Math.min(cur.r, lineas.length - 1)
   cur.c = Math.min(cur.c, lineas[cur.r]!.length)
-  const arriba = Math.max(0, cur.r - EL + 2)
   const anchoNum = 4
-  const desdeX = Math.max(0, cur.c - (QW - anchoNum - 4))
+  // Lo que se ve del texto: EL - 1 líneas (la última fila es la de Ln/Col y la barra
+  // horizontal) y el ancho menos el margen de números y la barra vertical.
+  const lineasVis = EL - 1
+  const anchoTexto = Math.max(1, QW - anchoNum - 2)
+  const finTexto = QX + QW - 1
+  const masLarga = lineas.reduce((a, l) => Math.max(a, l.length), 0)
+  const maxArriba = Math.max(0, lineas.length - lineasVis)
+  const maxIzq = Math.max(0, masLarga + 1 - anchoTexto)
+  const arriba = limitar(tab.arriba ?? cur.r - EL + 2, 0, maxArriba)
+  const desdeX = limitar(tab.izq ?? cur.c - (QW - anchoNum - 4), 0, maxIzq)
+  /** La pestaña con el cursor a la vista, moviendo lo justo. */
+  const verCursor = (p: Pestana): Pestana => {
+    const a = p.cur.r < arriba ? p.cur.r : p.cur.r >= arriba + lineasVis ? p.cur.r - lineasVis + 1 : arriba
+    const iz = p.cur.c < desdeX ? p.cur.c : p.cur.c >= desdeX + anchoTexto ? p.cur.c - anchoTexto + 1 : desdeX
+    return { ...p, arriba: Math.max(0, a), izq: Math.max(0, iz) }
+  }
+  // Las barras parten del estado más reciente: el apretar y el soltar de un clic
+  // pueden llegar en el mismo cuadro, antes de que este dibujo se repita.
+  const moverEditor = (cambio: Partial<Pestana>) => {
+    const ahora = surface.state ?? S
+    surface.setState({ ...ahora, pestanas: ahora.pestanas.map((p, i) => (i === ahora.pestana ? { ...p, arriba, izq: desdeX, ...cambio } : p)) })
+  }
   L.zona(QX, ED, QW, EL, 'editor', () => {})
   // Las líneas de arriba no se dibujan: solo importa si dejan un /* abierto.
   let enComentario = false
@@ -464,22 +517,24 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
     for (const [s, c] of tokens) {
       for (const ch of s) {
         const marcada = sel !== null && off >= sel[0] && off < sel[1]
-        if (x >= QX + anchoNum + 1 && x < QX + QW) L.put(x, y, ch, c, marcada ? T.sel : undefined)
+        if (x >= QX + anchoNum + 1 && x < finTexto) L.put(x, y, ch, c, marcada ? T.sel : undefined)
         x++
         off++
       }
     }
     // el salto de línea seleccionado se ve como una celda marcada al final
-    if (sel !== null && off >= sel[0] && off < sel[1] && x >= QX + anchoNum + 1 && x < QX + QW) L.put(x, y, ' ', T.texto, T.sel)
+    if (sel !== null && off >= sel[0] && off < sel[1] && x >= QX + anchoNum + 1 && x < finTexto) L.put(x, y, ' ', T.texto, T.sel)
     offLinea += lineas[i]!.length + 1
   }
   if (!tab.sql && S.foco !== 'editor') L.put(QX + anchoNum + 1, ED, 'Haz clic aquí y escribe una consulta…', T.tenue)
   if (S.foco === 'editor' && S.parpadeo) {
     const x = QX + anchoNum + 1 + cur.c - desdeX
     const y = ED + cur.r - arriba
-    const celda = L.celdas[y]?.[x]
+    const celda = x < finTexto && y < ED + lineasVis ? L.celdas[y]?.[x] : undefined
     if (celda) { celda.b = T.texto; celda.f = T.fondo }
   }
+  barra({ id: 'edV', x: finTexto, y: ED, largo: lineasVis, vertical: true, pos: arriba, max: maxArriba, frac: lineasVis / Math.max(1, lineas.length), paso: 3, pagina: Math.max(1, lineasVis - 1), mover: n => moverEditor({ arriba: n }) })
+  barra({ id: 'edH', x: QX + anchoNum + 1, y: ED + EL - 1, largo: QW - anchoNum - 25, vertical: false, pos: desdeX, max: maxIzq, frac: anchoTexto / Math.max(1, masLarga + 1), paso: 8, pagina: Math.max(1, anchoTexto - 4), mover: n => moverEditor({ izq: n }) })
   L.put(QX + QW - 22, ED + EL - 1, recortar(`Ln ${cur.r + 1}, Col ${cur.c + 1}`, 13), T.tenue, T.fondo)
   L.put(QX + QW - 8, ED + EL - 1, conexion ? (conexion.motor === 'mssql' ? 'T-SQL' : conexion.motor === 'postgres' ? 'PL/pgSQL' : 'SQL') : '', T.tenue, T.fondo)
 
@@ -523,6 +578,8 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
   let columnaEn: (x: number) => number | null = () => null
   const GY = RY + 1
   const GH = H - GY - 1
+  /** Filas de datos a la vista: el alto menos la cabecera y la barra horizontal. */
+  const filasRes = Math.max(1, GH - 2)
   L.fill(QX, GY, QW, GH, T.fondo)
   L.zona(QX, GY, QW, GH, 'cuerpo', () => cambiar(s => { s.foco = 'resultados' }))
   if (corriendo) {
@@ -547,18 +604,20 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
     else {
       const anchos = cj.anchos
       const numW = String(cj.total).length + 1
+      // La última columna es la barra vertical y la última fila la horizontal.
+      const finX = QX + QW - 1
       L.fill(QX, GY, QW, 1, T.cabecera)
       let cx = QX + numW + 1
-      for (let i = S.desdeCol; i < cj.columnas.length && cx < QX + QW; i++) {
+      for (let i = S.desdeCol; i < cj.columnas.length && cx < finX; i++) {
         const w = anchos[i]!
-        L.put(cx, GY, recortar(' ' + cj.columnas[i], Math.min(w, QX + QW - cx)), T.texto, T.cabecera, true)
-        if (cx + w - 1 < QX + QW) L.put(cx + w - 1, GY, '│', T.tenue, T.cabecera)
+        L.put(cx, GY, recortar(' ' + cj.columnas[i], Math.min(w, finX - cx)), T.texto, T.cabecera, true)
+        if (cx + w - 1 < finX) L.put(cx + w - 1, GY, '│', T.tenue, T.cabecera)
         cx += w
       }
-      const visibles = GH - 1
+      const visibles = filasRes
       // Dónde empieza cada columna visible, para saber qué celda toca un clic.
       const bordes: { c: number; x0: number; x1: number }[] = []
-      for (let c = S.desdeCol, x = QX + numW + 1; c < cj.columnas.length && x < QX + QW; c++) {
+      for (let c = S.desdeCol, x = QX + numW + 1; c < cj.columnas.length && x < finX; c++) {
         bordes.push({ c, x0: x, x1: x + anchos[c]! })
         x += anchos[c]!
       }
@@ -578,8 +637,8 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
           continue
         }
         let x = QX + numW + 1
-        for (let c = S.desdeCol; c < cj.columnas.length && x < QX + QW; c++) {
-          const w = Math.min(anchos[c]!, QX + QW - x)
+        for (let c = S.desdeCol; c < cj.columnas.length && x < finX; c++) {
+          const w = Math.min(anchos[c]!, finX - x)
           const j = c - cj.col0
           // Una columna que esta ventana no trae: queda en blanco hasta el próximo dibujo.
           if (j < 0 || j >= f.length) {
@@ -595,15 +654,12 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
           x += anchos[c]!
         }
       }
-      // desplazamiento
       const total = cj.total
-      if (total > visibles || S.desdeCol > 0 || cx >= QX + QW) {
-        let sx = QX + QW - 15
-        sx = L.boton(sx, GY, '◀', T.texto, T.pestanaOff, T.pestanaHover, 'izq', () => cambiar(s => { s.desdeCol = Math.max(0, s.desdeCol - 1) }), false)
-        sx = L.boton(sx, GY, '▶', T.texto, T.pestanaOff, T.pestanaHover, 'der', () => cambiar(s => { s.desdeCol = Math.min(cj.columnas.length - 1, s.desdeCol + 1) }), false)
-        sx = L.boton(sx, GY, '▲', T.texto, T.pestanaOff, T.pestanaHover, 'sub', () => cambiar(s => { s.desdeFila = Math.max(0, s.desdeFila - visibles) }), false)
-        L.boton(sx, GY, '▼', T.texto, T.pestanaOff, T.pestanaHover, 'baj', () => cambiar(s => { s.desdeFila = Math.min(Math.max(0, total - visibles), s.desdeFila + visibles) }), false)
-      }
+      const ncols = cj.columnas.length
+      barra({ id: 'resV', x: finX, y: GY + 1, largo: visibles, vertical: true, pos: S.desdeFila, max: total - visibles, frac: visibles / Math.max(1, total), paso: 3, pagina: Math.max(1, visibles - 1), mover: n => surface.setState({ ...(surface.state ?? S), desdeFila: n }) })
+      barra({ id: 'resH', x: QX + numW + 1, y: GY + GH - 1, largo: finX - QX - numW - 1, vertical: false, pos: S.desdeCol, max: ncols - 1, frac: bordes.length / Math.max(1, ncols), paso: 1, pagina: Math.max(1, bordes.length - 1), mover: n => surface.setState({ ...(surface.state ?? S), desdeCol: n }) })
+      L.fill(QX, GY + GH - 1, numW + 1, 1, T.cabecera)
+      L.fill(finX, GY + GH - 1, 1, 1, T.cabecera)
     }
   }
 
@@ -614,7 +670,7 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
   const bajoPuntero = S.hover ? (cortados[S.hover] ?? AYUDAS[S.hover]) : undefined
   if (S.nota) L.put(1, SY, recortar('⚠ ' + S.nota, W - 50), T.error)
   else if (bajoPuntero && !S.arrastre) L.put(1, SY, recortar(bajoPuntero, W - 50), T.texto)
-  else if (S.arrastre) L.put(1, SY, S.arrastre === 'v' ? `Explorador: ${EW} columnas` : `Consulta: ${EL - 1} líneas · resultados: ${H - ED - EL - 3} filas`, T.acento, undefined, true)
+  else if (typeof S.arrastre === 'string') L.put(1, SY, S.arrastre === 'v' ? `Explorador: ${EW} columnas` : `Consulta: ${EL - 1} líneas · resultados: ${H - ED - EL - 3} filas`, T.acento, undefined, true)
   else if (corriendo) L.put(1, SY, '⠿ Ejecutando…', T.tenue, undefined, true)
   else if (mal) L.put(1, SY, '✗ La consulta terminó con errores', T.error, undefined, true)
   else if (res?.estado === 'listo') L.put(1, SY, '✓ Consulta ejecutada correctamente', T.ok, undefined, true)
@@ -788,6 +844,18 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
     surface.onPointer((ev: ClientPointerEvent) => {
       const z = L.zonaEn(ev.x, ev.y)
       if (ev.type === 'down' && S.nota) S.nota = null
+      // Lo que empezó un «apretar» de este mismo cuadro todavía no está en S.
+      const ahora = surface.state ?? S
+      // Arrastrar el pulgar de una barra: la posición sigue al puntero.
+      if (typeof ahora.arrastre === 'object' && ahora.arrastre && ev.type === 'move') {
+        const b = barras[ahora.arrastre.barra]
+        if (b && b.max > 0) {
+          const k = (b.vertical ? ev.y - b.y : ev.x - b.x) - 1 - ahora.arrastre.agarre
+          const n = limitar(Math.round((k / Math.max(1, b.pista - b.pulgar)) * b.max), 0, b.max)
+          if (n !== b.pos) b.mover(n)
+        }
+        return
+      }
       // Arrastrar un divisor: el explorador cambia de ancho o el editor de alto.
       if (S.arrastre && ev.type === 'move') {
         if (S.arrastre === 'v') {
@@ -799,8 +867,16 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
         }
         return
       }
-      if (S.arrastre && (ev.type === 'up' || ev.type === 'leave')) {
-        surface.setState({ ...S, arrastre: null })
+      if (ahora.arrastre && (ev.type === 'up' || ev.type === 'leave')) {
+        surface.setState({ ...ahora, arrastre: null })
+        return
+      }
+      const parte = z?.id.match(/^(edV|edH|resV|resH):(pulgar|pista)$/)
+      if (ev.type === 'down' && (!ev.button || ev.button === 'left') && parte && !S.dlg && !S.menu) {
+        const b = barras[parte[1]!]!
+        const k = (b.vertical ? ev.y - b.y : ev.x - b.x) - 1
+        if (parte[2] === 'pulgar') surface.setState({ ...S, arrastre: { barra: parte[1]!, agarre: k - b.desde } })
+        else b.mover(limitar(k < b.desde ? b.pos - b.pagina : b.pos + b.pagina, 0, b.max))
         return
       }
       if (ev.type === 'down' && (!ev.button || ev.button === 'left') && (z?.id === 'divV' || z?.id === 'divH') && !S.dlg) {
@@ -813,10 +889,11 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
         if (cur.r !== tab.cur.r || cur.c !== tab.cur.c) surface.setState({ ...S, pestanas: conTab(p => ({ ...p, cur })) })
         return
       }
-      if (S.arrastrando && (ev.type === 'up' || ev.type === 'leave')) {
-        const s = seleccion(tab)
-        if (s) pedir({ t: 'copiarTexto', texto: tab.sql.slice(s[0], s[1]), que: 'Selección copiada.' })
-        surface.setState({ ...S, arrastrando: false })
+      if (ahora.arrastrando && (ev.type === 'up' || ev.type === 'leave')) {
+        const t = ahora.pestanas[ahora.pestana] ?? tab
+        const s = seleccion(t)
+        if (s) pedir({ t: 'copiarTexto', texto: t.sql.slice(s[0], s[1]), que: 'Selección copiada.' })
+        surface.setState({ ...ahora, arrastrando: false })
         return
       }
       if (ev.type === 'move' || ev.type === 'enter') {
@@ -838,7 +915,8 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
       if (z?.id === 'editor') {
         const cur = posEditor(ev.x, ev.y)
         // Shift+clic extiende la selección; un clic solo la empieza de nuevo.
-        surface.setState({ ...S, foco: 'editor', parpadeo: true, menu: null, arrastrando: true, celda: null, pestanas: conTab(p => ({ ...p, cur, ancla: ev.shift ? p.ancla ?? p.cur : cur })) })
+        // El editor se queda donde está: el clic no lo hace saltar.
+        surface.setState({ ...S, foco: 'editor', parpadeo: true, menu: null, arrastrando: true, celda: null, pestanas: conTab(p => ({ ...p, cur, ancla: ev.shift ? p.ancla ?? p.cur : cur, arriba, izq: desdeX })) })
         return
       }
       if (z?.id.startsWith('fila')) {
@@ -849,7 +927,8 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
       }
       if (z && abrirSiTabla(z.id)) return
       if (z) {
-        if (z.id !== 'cuerpo' && !z.id.startsWith('fila') && !z.id.startsWith('f') && S.foco === 'editor' && !S.dlg) S.foco = null
+        // Las flechas de las barras del editor no le quitan el foco.
+        if (z.id !== 'cuerpo' && !z.id.startsWith('fila') && !z.id.startsWith('f') && !z.id.startsWith('ed') && S.foco === 'editor' && !S.dlg) S.foco = null
         z.accion()
       } else if (S.foco) surface.setState({ ...S, foco: null })
     })
@@ -944,7 +1023,7 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
     if (S.foco === 'resultados') {
       const cj = conjuntos[S.conjunto]
       if (!cj) return
-      const paso = Math.max(1, H - (ED + EL) - 3)
+      const paso = filasRes
       const max = Math.max(0, cj.total - 1)
       const f = S.fila ?? S.desdeFila
       let nf = f
@@ -959,7 +1038,7 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
       return cambiar(s => { s.fila = nf; s.desdeFila = desde })
     }
     if (S.foco !== 'editor') return
-    const poner = (p: Pestana) => surface.setState({ ...S, parpadeo: true, pestanas: S.pestanas.map((x, i) => (i === S.pestana ? p : x)) })
+    const poner = (p: Pestana) => surface.setState({ ...S, parpadeo: true, pestanas: S.pestanas.map((x, i) => (i === S.pestana ? verCursor(p) : x)) })
     const letra = 'texto' in leida ? leida.texto.toLowerCase() : ''
     // Atajos con Ctrl (Ctrl+C no llega: la terminal lo usa para soltar el panel).
     if (ev.ctrl) {
