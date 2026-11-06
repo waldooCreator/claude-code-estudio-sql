@@ -52,6 +52,8 @@ claude --plugin-dir ./claude-code-estudio-sql
 | 🧭 **Explorador de objetos** | Conexiones → bases → tablas, vistas y procedimientos. Su borde se arrastra para darle más ancho. |
 | ✍️ **Editor con pestañas** | Colores de SQL, números de línea, varias consultas abiertas a la vez. |
 | 📋 **Resultados en cuadrícula** | Varios conjuntos, `NULL` resaltado, clic derecho → **Copiar celda**, botones **Copiar** (TSV) y **CSV**. |
+| ✏️ **Editar celdas** | Doble clic en una celda, escribe y `Enter`: ves el `UPDATE` exacto y otro `Enter` lo guarda. Detalles abajo. |
+| ↕️ **Barras de desplazamiento** | En la consulta y en los resultados, vertical y horizontal: flechas, clic en la pista y pulgar arrastrable. |
 | 🤖 **Pasar a Claude** | Manda la consulta y una muestra del resultado a la conversación para que Claude lo analice. |
 | 🔒 **Solo lectura por conexión** | Ideal para producción: rechaza `INSERT`, `UPDATE`, `DELETE`, `DROP`, `EXEC`… |
 | 🔑 **Contraseñas en el llavero** | Se guardan en el llavero del sistema (Secret Service, Keychain o Credential Manager), nunca en texto plano. |
@@ -70,6 +72,18 @@ El mod le da a Claude la herramienta `consultar`. Cuando le pides algo como *«�
 3. y recibe la tabla para responderte.
 
 Tú ves exactamente qué corrió y qué devolvió. Si Claude no sabe el nombre de la conexión, la herramienta le responde con la lista de las que tienes.
+
+## Editar una celda
+
+Doble clic en una celda de los resultados abre un recuadro con su valor:
+
+1. escribe el valor nuevo (`NULL` deja la celda vacía) y pulsa `Enter`;
+2. el recuadro muestra el `UPDATE` exacto que se va a ejecutar;
+3. `Enter` otra vez (o **Confirmar**) lo ejecuta. **Cancelar** o un clic fuera lo descarta.
+
+Se puede editar cuando la conexión **no** es de solo lectura y la consulta lee de **una sola tabla con clave primaria**, y esa clave está entre las columnas (un `SELECT *` sirve). Si no, el recuadro dice por qué. Las columnas calculadas o de identidad no se editan. En SQL Server y PostgreSQL el servidor dice de qué tabla sale cada columna; en MySQL y SQLite se reconoce la forma `SELECT … FROM tabla`.
+
+El `UPDATE` corre en una transacción que solo se confirma si cambia exactamente una fila, y antes revisa que nadie haya cambiado ese valor mientras lo editabas. Si el motor lo rechaza, su error se ve entero en el recuadro y lo escrito se conserva para corregirlo.
 
 ## Atajos
 
@@ -102,6 +116,15 @@ tests/               pruebas (claude plugin test)
 ```bash
 claude plugin test .      # corre las pruebas
 claude --plugin-dir .     # abre una sesión con el mod cargado desde esta carpeta
+```
+
+Las pruebas del puente corren siempre contra SQLite; contra los demás motores, si les das un servidor de prueba (por ejemplo en contenedores):
+
+```bash
+cd puente
+ESQL_MSSQL=127.0.0.1:51433 ESQL_CLAVE_MSSQL=… \
+ESQL_PG=127.0.0.1:55432 ESQL_CLAVE_PG=… \
+ESQL_MY=127.0.0.1:53306 ESQL_CLAVE_MY=… go test ./...
 ```
 
 Para recompilar el puente (Go 1.26):

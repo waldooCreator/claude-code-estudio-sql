@@ -13,6 +13,9 @@ let vistaAcusada = ''
 let pedidoReciente = false
 /** Un pedido más grande que esto no llega al mod (el motor no lo envía). */
 const MAX_PEDIDO = 90_000
+/** Dos clics en la misma celda dentro de este tiempo son un doble clic: editarla. */
+const DOBLE_CLIC_MS = 450
+let clicPrevio = { id: '', t: 0 }
 
 type Pos = { r: number; c: number }
 /** `ancla`: el otro extremo de la selección, si hay una. */
@@ -79,6 +82,10 @@ type Estado = {
   altoEditor: number | null
   /** Un aviso del propio panel (p. ej. un texto demasiado largo para enviarlo). */
   nota: string | null
+  /** Lo que se escribe en la celda en edición (Modelo.edicion.n) y dónde va el cursor. */
+  edit: { n: number; texto: string; cur: number } | null
+  /** La última edición que se cerró aquí: no se vuelve a abrir con las props viejas. */
+  editCerrada: number
 }
 
 const MOTORES: [Motor, string, string][] = [
@@ -133,6 +140,8 @@ function inicial(m: Modelo): Estado {
     anchoExp: null,
     altoEditor: null,
     nota: null,
+    edit: null,
+    editCerrada: 0,
   }
 }
 
@@ -193,6 +202,9 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
       const d = S.dlg
       const limpio = texto.replace(/[\r\n\t]/g, '')
       surface.setState({ ...S, pegadoN: m.pegado.n, dlg: { ...d, campos: { ...d.campos, [d.campo]: (d.campos[d.campo] ?? '') + limpio }, claveTocada: d.claveTocada || d.campo === 'clave' } })
+    } else if (S.edit && m.edicion?.n === S.edit.n && S.edit.n !== S.editCerrada) {
+      const t = texto.replace(/[\r\n\t]+/g, ' ')
+      surface.setState({ ...S, pegadoN: m.pegado.n, edit: { ...S.edit, texto: S.edit.texto.slice(0, S.edit.cur) + t + S.edit.texto.slice(S.edit.cur), cur: S.edit.cur + t.length } })
     } else if (S.foco === 'editor') {
       surface.setState({ ...S, pegadoN: m.pegado.n, parpadeo: true, pestanas: S.pestanas.map((p, i) => (i === S.pestana ? insertar(p, texto) : p)) })
     } else surface.setState({ ...S, pegadoN: m.pegado.n })
@@ -210,6 +222,15 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
     // Claude ocupa el editor: el foco sale de ahí para que lo que se teclee no caiga en su pestaña.
     surface.setState({ ...actual, encargoN: m.encargo.n, pestanas, pestana: pestanas.findIndex(p => p.id === e.id), foco: actual.foco === 'editor' ? null : actual.foco, menu: null, vista: 'res', conjunto: 0, fila: null, desdeFila: 0, desdeCol: 0, celda: null })
   }
+  // El mod abrió una celda para editarla: el texto empieza con su valor.
+  {
+    const actual = surface.state
+    const e = m.edicion
+    if (actual && e && e.estado !== 'bloqueada' && e.n !== actual.editCerrada && actual.edit?.n !== e.n) {
+      const texto = e.original ?? 'NULL'
+      surface.setState({ ...actual, edit: { n: e.n, texto, cur: texto.length }, foco: 'resultados', fila: e.fila, celda: { f: e.fila, c: e.col }, menu: null, parpadeo: true })
+    }
+  }
   const W = surface.columns || 100
   const H = surface.rows || 30
   const T: Tema = m.tema === 'oscuro' ? OSCURO : CLARO
@@ -224,6 +245,70 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
   const conexion = m.conexiones.find(c => c.id === tab.conexion) ?? m.conexiones[0]
   const res = m.resultados[tab.id]
   const corriendo = res?.estado === 'corriendo'
+
+  // ── Edición de una celda (doble clic)
+  type EdicionM = NonNullable<Modelo['edicion']>
+  function edicionActiva(): EdicionM | null {
+    const e = m.edicion
+    return e && e.n !== S.editCerrada && e.pestana === tab.id ? e : null
+  }
+  /** Enter: primero arma el UPDATE para verlo; con el mismo texto, el segundo Enter lo ejecuta. */
+  function enviarEdicion() {
+    const e = edicionActiva()
+    if (!e || !S.edit || S.edit.n !== e.n || e.estado === 'guardando' || e.estado === 'bloqueada') return
+    pedir({ t: 'guardarCelda', n: e.n, valor: S.edit.texto, confirmado: e.estado === 'confirmar' && e.valor === S.edit.texto })
+  }
+  function cerrarEdicion() {
+    const e = m.edicion
+    if (!e) return
+    surface.setState({ ...(surface.state ?? S), edit: null, editCerrada: e.n })
+    pedir({ t: 'cancelarEdicion', n: e.n })
+  }
+  /** El recuadro de edición, debajo de la fila (o encima si no cabe). */
+  function dibujarEdicion(e: EdicionM, x0: number, arriba: number, w: number, alto: number, filaY: number) {
+    const ed = S.edit && S.edit.n === e.n ? S.edit : null
+    const bloqueada = e.estado === 'bloqueada' || !ed
+    const confirmar = e.estado === 'confirmar' && ed?.texto === e.valor
+    const msg = e.error
+      ? envolver('✗ ' + e.error, w - 4)
+      : confirmar
+        ? envolver(`¿Guardar? ${e.sql}  · Enter o Confirmar lo ejecuta`, w - 4)
+        : e.estado === 'guardando'
+          ? ['⠿ Guardando…']
+          : ['Enter: ver el UPDATE y guardar · NULL deja la celda vacía · Cancelar o clic fuera para salir']
+    const lineasMsg = msg.slice(0, 4)
+    const h = 1 + (bloqueada ? 0 : 1) + lineasMsg.length
+    if (alto < h) return
+    const y0 = filaY >= arriba && filaY + h < arriba + alto ? filaY + 1 : filaY - h >= arriba && filaY < arriba + alto ? filaY - h : arriba + alto - h
+    L.zona(x0, y0, w, h, 'editCaja', () => {})
+    L.fill(x0, y0, w, h, T.panel)
+    L.fill(x0, y0, w, 1, T.cabecera)
+    const botones: [string, string, () => void][] = bloqueada
+      ? [['Cerrar', 'editCancelar', cerrarEdicion]]
+      : [[confirmar ? 'Confirmar' : 'Guardar', 'editGuardar', enviarEdicion], ['Cancelar', 'editCancelar', cerrarEdicion]]
+    let bx = x0 + w - 1
+    for (const [label] of botones) bx -= label.length + 3
+    const titulo = bloqueada ? ` ✎ ${e.columna}: no se puede editar` : ` ✎ ${e.tabla} · ${e.columna} · fila ${e.fila + 1}`
+    L.put(x0, y0, recortar(titulo, bx - x0 - 1), T.texto, T.cabecera, true)
+    for (const [label, id, accion] of botones) {
+      const primario = id === 'editGuardar'
+      bx = L.boton(bx, y0, label, primario ? '#ffffff' : T.texto, primario ? T.acento : T.pestanaOff, primario ? T.primarioHover : T.pestanaHover, id, accion, primario) + 1
+    }
+    let y = y0 + 1
+    if (!bloqueada && ed) {
+      const ancho = Math.max(1, w - 4)
+      const desde = Math.max(0, ed.cur - ancho + 1)
+      L.fill(x0 + 1, y, w - 2, 1, T.campoOn)
+      L.put(x0 + 2, y, ed.texto.slice(desde, desde + ancho), ed.texto === 'NULL' ? T.tenue : T.texto, T.campoOn)
+      if (S.parpadeo && e.estado !== 'guardando') {
+        const celda = L.celdas[y]?.[x0 + 2 + ed.cur - desde]
+        if (celda) { celda.b = T.texto; celda.f = T.campoOn }
+      }
+      y++
+    }
+    const color = e.error ? T.error : confirmar ? T.acento : T.tenue
+    lineasMsg.forEach((linea, i) => L.put(x0 + 2, y + i, i === 3 && msg.length > 4 ? recortar(linea, w - 5) + '…' : recortar(linea, w - 4), color, T.panel, !!e.error || confirmar))
+  }
 
   // Al mod le llega solo lo que se mira: qué filas traer y qué pestañas siguen abiertas.
   const ahora = surface.state ?? S
@@ -660,6 +745,8 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
       barra({ id: 'resH', x: QX + numW + 1, y: GY + GH - 1, largo: finX - QX - numW - 1, vertical: false, pos: S.desdeCol, max: ncols - 1, frac: bordes.length / Math.max(1, ncols), paso: 1, pagina: Math.max(1, bordes.length - 1), mover: n => surface.setState({ ...(surface.state ?? S), desdeCol: n }) })
       L.fill(QX, GY + GH - 1, numW + 1, 1, T.cabecera)
       L.fill(finX, GY + GH - 1, 1, 1, T.cabecera)
+      const ed = edicionActiva()
+      if (ed && ed.conjunto === S.conjunto) dibujarEdicion(ed, QX, GY + 1, finX - QX, visibles, GY + 1 + ed.fila - S.desdeFila)
     }
   }
 
@@ -906,6 +993,13 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
         return
       }
       if (ev.type !== 'down') return
+      // Un clic fuera del recuadro de edición la cancela (y el clic sigue su curso).
+      const edA = edicionActiva()
+      if (edA && !(z?.id ?? '').startsWith('edit')) {
+        S.edit = null
+        S.editCerrada = edA.n
+        pedir({ t: 'cancelarEdicion', n: edA.n })
+      }
       if (ev.button === 'right') return menuContextual(z?.id ?? '', ev.x, ev.y)
       if (ev.button && ev.button !== 'left') return
       if (S.menu && !(z && z.id.startsWith('mi')) && z?.id !== 'menuCon' && z?.id !== 'menuBase') {
@@ -922,7 +1016,13 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
       if (z?.id.startsWith('fila')) {
         const f = Number(z.id.slice(4))
         const c = columnaEn(ev.x)
+        // Dos clics seguidos en la misma celda: editarla.
+        const id = `${f}:${c}`
+        const ms = Date.now()
+        const doble = c !== null && clicPrevio.id === id && ms - clicPrevio.t < DOBLE_CLIC_MS
+        clicPrevio = doble ? { id: '', t: 0 } : { id, t: ms }
         surface.setState({ ...S, fila: f, celda: c === null ? null : { f, c }, foco: 'resultados', menu: null })
+        if (doble && c !== null) pedir({ t: 'editar', pestana: tab.id, conjunto: S.conjunto, fila: f, col: c })
         return
       }
       if (z && abrirSiTabla(z.id)) return
@@ -1009,6 +1109,9 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
     const n = S.n + 1
     const p: Pestana = { id: 'q' + n + '-' + Date.now(), nombre: `${o.name}.sql`, conexion: c.id, base, sql, cur: { r: 0, c: 0 } }
     surface.setState({ ...S, n, sel: id, pestanas: [...S.pestanas, p], pestana: S.pestanas.length, vista: 'res', conjunto: 0, fila: null, desdeFila: 0, desdeCol: 0, foco: null })
+    // El pedido lleva ya la pestaña nueva: si el resultado llega antes que la próxima vista,
+    // el mod no la da por cerrada.
+    vistaQuerida = { pestana: p.id, conjunto: 0, desde: 0, col: 0, pestanas: [...S.pestanas.map(x => x.id), p.id], pegado: S.pegadoN }
     pedir({ t: 'ejecutar', pestana: p.id, conexion: c.id, base, sql })
     return true
   }
@@ -1017,6 +1120,30 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
     const leida = leerTecla(ev)
     if (!leida) return
     const k = 'tecla' in leida ? leida.tecla : ''
+    // Con una celda en edición, las teclas son del campo de edición.
+    const edA = edicionActiva()
+    if (edA && !S.dlg) {
+      if (edA.estado === 'bloqueada' || !S.edit || S.edit.n !== edA.n) {
+        if (k === 'return') return cerrarEdicion()
+      } else {
+        const ed = S.edit
+        if (edA.estado === 'guardando') return
+        const poner = (texto: string, cur: number) => surface.setState({ ...S, parpadeo: true, edit: { ...ed, texto, cur } })
+        if (k === 'return') return enviarEdicion()
+        if (k === 'left') return poner(ed.texto, Math.max(0, ed.cur - 1))
+        if (k === 'right') return poner(ed.texto, Math.min(ed.texto.length, ed.cur + 1))
+        if (k === 'home') return poner(ed.texto, 0)
+        if (k === 'end') return poner(ed.texto, ed.texto.length)
+        if (k === 'backspace') return ed.cur > 0 ? poner(ed.texto.slice(0, ed.cur - 1) + ed.texto.slice(ed.cur), ed.cur - 1) : undefined
+        if (k === 'delete') return poner(ed.texto.slice(0, ed.cur) + ed.texto.slice(ed.cur + 1), ed.cur)
+        if (ev.ctrl && 'texto' in leida && leida.texto.toLowerCase() === 'v') return pedir({ t: 'pegar' })
+        if (!ev.ctrl && !ev.meta && 'texto' in leida) {
+          const t = leida.texto.replace(/[\r\n\t]+/g, ' ')
+          return poner(ed.texto.slice(0, ed.cur) + t + ed.texto.slice(ed.cur), ed.cur + t.length)
+        }
+        return
+      }
+    }
     // Ctrl+E como en SSMS; Ctrl+Enter donde la terminal lo distingue; F5 si llega.
     if (k === 'f5' || (ev.ctrl && (k === 'return' || ('texto' in leida && leida.texto.toLowerCase() === 'e')))) return ejecutar()
     if (S.dlg) return teclasDialogo(S.dlg, ev, leida)

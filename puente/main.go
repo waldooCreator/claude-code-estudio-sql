@@ -43,6 +43,8 @@ func main() {
 	route(mux, "/query", handleQuery)
 	route(mux, "/cancel", handleCancel)
 	route(mux, "/schema", handleSchema)
+	route(mux, "/editable", handleEditable)
+	route(mux, "/update", handleUpdate)
 	route(mux, "/secret/set", handleSecretSet)
 	route(mux, "/secret/delete", handleSecretDelete)
 	route(mux, "/close", handleClose)

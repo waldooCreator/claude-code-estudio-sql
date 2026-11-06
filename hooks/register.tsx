@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Conexion, Conjunto, Encargo, Esquema, Modelo, Objeto, Pedido, Prueba, Resultado, Vista } from '../types'
+import type { Conexion, Conjunto, Edicion, Encargo, Esquema, Modelo, Objeto, Pedido, Prueba, Resultado, Vista } from '../types'
 
 const PANEL = 'estudio-sql'
 const MAX_FILAS = 5000 // las que trae el puente; el panel las recorre por ventanas
@@ -30,6 +30,7 @@ const VACIO: Modelo = {
   ampliado: false,
   pegado: null,
   encargo: null,
+  edicion: null,
 }
 const modelo = atom({ plugin: 'estudio-sql', key: 'modelo' } as const, VACIO)
 const vista = atom({ plugin: 'estudio-sql', key: 'vista' } as const, { pestana: '', conjunto: 0, desde: 0, col: 0, pestanas: [], pegado: 0 } as Vista)
@@ -76,6 +77,15 @@ async function leerDelSistema($: EngineInterface): Promise<string | null> {
 
 // Resultados completos por pestaña (el panel recibe una versión recortada).
 const completos = new Map<string, { columnas: string[]; filas: unknown[][] }[]>()
+/** De qué consulta salió el resultado de cada pestaña: lo necesita la edición en la cuadrícula. */
+const origenes = new Map<string, { sql: string; conexion: string; base: string }>()
+/** Lo que el puente dijo sobre si el resultado de una pestaña se puede editar. */
+type Editable = { editable: boolean; reason?: string; table: unknown; display: string; sources: string[]; key: number[]; keyColumns: string[] }
+const editables = new Map<string, Editable>()
+/** Un valor más largo no se edita en el panel: no cabría en lo que viaja en cada dibujo. */
+const MAX_EDICION = 20_000
+/** Cuenta las ediciones: cada una lleva un número nuevo, aunque se haya cancelado la anterior. */
+let ediciones = 0
 let socket: string | null = null
 let arrancando: Promise<string> | null = null
 
@@ -278,7 +288,9 @@ async function ejecutar($: EngineInterface, p: Extract<Pedido, { t: 'ejecutar' }
   const conexion = m.conexiones.find(c => c.id === p.conexion)
   if (!conexion) return
   const corriendo: Resultado = { estado: 'corriendo', conexion: p.conexion, base: p.base, conjuntos: [], mensajes: [] }
-  await update($, modelo, x => ({ ...x, aviso: null, resultados: { ...x.resultados, [p.pestana]: corriendo } }))
+  editables.delete(p.pestana)
+  origenes.delete(p.pestana)
+  await update($, modelo, x => ({ ...x, aviso: null, resultados: { ...x.resultados, [p.pestana]: corriendo }, edicion: x.edicion?.pestana === p.pestana ? null : x.edicion }))
   await update($, fallas, () => ({ n: 0, motivo: '' }))
   let fin: Resultado
   try {
@@ -317,10 +329,91 @@ async function ejecutar($: EngineInterface, p: Extract<Pedido, { t: 'ejecutar' }
       return
     }
     completos.set(p.pestana, r.results.map(rs => ({ columnas: rs.columns, filas: rs.rows })))
+    origenes.set(p.pestana, { sql: p.sql, conexion: p.conexion, base: p.base })
   } catch (err) {
     fin = { estado: 'listo', conexion: p.conexion, base: p.base, fallo: true, error: mensaje(err), conjuntos: [], mensajes: [{ texto: mensaje(err), error: true }] }
   }
   await update($, modelo, x => ({ ...x, resultados: { ...x.resultados, [p.pestana]: fin } }))
+}
+
+// ── Edición en la cuadrícula: doble clic en una celda, Enter arma el UPDATE y
+// Enter otra vez lo ejecuta. El puente decide si la consulta es editable.
+
+async function editarCelda($: EngineInterface, p: Extract<Pedido, { t: 'editar' }>): Promise<void> {
+  const m = await read($, modelo)
+  const rs = completos.get(p.pestana)?.[p.conjunto]
+  const o = origenes.get(p.pestana)
+  const conexion = m.conexiones.find(c => c.id === o?.conexion)
+  const valor = rs?.filas[p.fila]?.[p.col]
+  const n = ++ediciones
+  const base: Edicion = { n, pestana: p.pestana, conjunto: p.conjunto, fila: p.fila, col: p.col, tabla: '', columna: rs?.columnas[p.col] ?? '', original: aTextoCompleto(valor), estado: 'bloqueada' }
+  const bloquear = (error: string) => update($, modelo, x => ({ ...x, edicion: { ...base, original: null, error } }))
+  if (!rs || !o || !conexion || p.fila >= rs.filas.length) return void (await bloquear('Vuelve a ejecutar la consulta para editar sus resultados.'))
+  if (p.conjunto > 0) return void (await bloquear('Solo se edita el primer conjunto de resultados: deja la consulta de esta tabla sola en la pestaña.'))
+  if (conexion.soloLectura) return void (await bloquear(`«${conexion.nombre}» es de solo lectura. Para editar, desactiva «Solo lectura» en la conexión (clic derecho sobre ella → Editar).`))
+  let info = editables.get(p.pestana)
+  if (!info) {
+    try {
+      info = await puente<Editable>($, '/editable', { conn: alPuente(conexion), database: o.base, sql: o.sql, columns: rs.columnas })
+    } catch (err) {
+      return void (await bloquear(mensaje(err)))
+    }
+    editables.set(p.pestana, info)
+  }
+  if (!info.editable) return void (await bloquear(info.reason ?? 'Esta consulta no se puede editar.'))
+  const ed: Edicion = { ...base, tabla: info.display }
+  if (!info.sources[p.col]) return void (await update($, modelo, x => ({ ...x, edicion: { ...ed, original: null, error: `La columna «${base.columna}» no se puede editar: es calculada, de identidad o no sale de ${info.display}.` } })))
+  if ((ed.original?.length ?? 0) > MAX_EDICION) return void (await update($, modelo, x => ({ ...x, edicion: { ...ed, original: null, error: `El valor tiene ${ed.original!.length.toLocaleString('es')} caracteres: es demasiado largo para editarlo aquí.` } })))
+  await update($, modelo, x => ({ ...x, edicion: { ...ed, estado: 'editando' as const } }))
+}
+
+async function guardarCelda($: EngineInterface, p: Extract<Pedido, { t: 'guardarCelda' }>): Promise<void> {
+  const m = await read($, modelo)
+  const e = m.edicion
+  if (!e || e.n !== p.n || e.estado === 'bloqueada' || e.estado === 'guardando') return
+  const rs = completos.get(e.pestana)?.[e.conjunto]
+  const o = origenes.get(e.pestana)
+  const info = editables.get(e.pestana)
+  const conexion = m.conexiones.find(c => c.id === o?.conexion)
+  const fila = rs?.filas[e.fila]
+  const poner = (cambio: Partial<Edicion>) => update($, modelo, x => (x.edicion?.n === e.n ? { ...x, edicion: { ...x.edicion, ...cambio } } : x))
+  if (!rs || !o || !info || !conexion || !fila) return void (await poner({ estado: 'editando', error: 'Vuelve a ejecutar la consulta: el resultado ya no está.' }))
+  const cuerpo = {
+    conn: alPuente(conexion),
+    database: o.base,
+    table: info.table,
+    column: info.sources[e.col],
+    key: info.key.map((i, j) => ({ column: info.keyColumns[j], value: fila[i] })),
+    value: p.valor === 'NULL' ? null : p.valor,
+    original: fila[e.col],
+  }
+  if (!p.confirmado) {
+    try {
+      const r = await puente<{ sql: string }>($, '/update', { ...cuerpo, dryRun: true })
+      await poner({ estado: 'confirmar', valor: p.valor, sql: r.sql, error: undefined })
+    } catch (err) {
+      await poner({ estado: 'editando', error: mensaje(err) })
+    }
+    return
+  }
+  await poner({ estado: 'guardando', error: undefined })
+  try {
+    const r = await puente<{ sql: string; value: unknown }>($, '/update', cuerpo)
+    fila[e.col] = r.value
+    await update($, modelo, x => {
+      const res = x.resultados[e.pestana]
+      if (!res) return { ...x, edicion: x.edicion?.n === e.n ? null : x.edicion }
+      const mensajes = [...res.mensajes, { texto: `(1 fila actualizada) ${r.sql}` }]
+      // La columna se ensancha si el valor nuevo es más largo que los que había.
+      const largo = Math.min(MAX_ANCHO_COLUMNA, (aTexto(r.value) ?? 'NULL').length + 2)
+      const conjuntos = res.conjuntos.map((c, i) => (i === e.conjunto ? { ...c, anchos: c.anchos.map((w, j) => (j === e.col ? Math.max(w, largo) : w)) } : c))
+      return { ...x, edicion: x.edicion?.n === e.n ? null : x.edicion, resultados: { ...x.resultados, [e.pestana]: { ...res, mensajes, conjuntos } } }
+    })
+    $.ui.toast(`Guardado en ${info.display}: 1 fila actualizada.`)
+  } catch (err) {
+    // El error del motor se muestra entero en el panel; lo escrito se conserva para corregirlo.
+    await poner({ estado: 'editando', error: mensaje(err) })
+  }
 }
 
 async function cargarEsquema($: EngineInterface, idConexion: string, base?: string): Promise<void> {
@@ -469,6 +562,13 @@ async function atender($: EngineInterface, p: Pedido, superficie: 'terminal' | s
     }
     case 'ver':
       return // la vista ya se aplicó al llegar el pedido
+    case 'editar':
+      return editarCelda($, p)
+    case 'guardarCelda':
+      return guardarCelda($, p)
+    case 'cancelarEdicion':
+      await update($, modelo, m => (m.edicion?.n === p.n ? { ...m, edicion: null } : m))
+      return
     case 'ampliar': {
       const m = await update($, modelo, x => ({ ...x, ampliado: !x.ampliado }))
       await abrir($, false, m.ampliado)
@@ -511,6 +611,7 @@ async function verVista($: EngineInterface, v: Vista): Promise<void> {
     })
     const deClaude = (await read($, modelo)).encargo?.pestana.id
     for (const id of [...completos.keys()]) if (!abiertas.has(id) && id !== deClaude) completos.delete(id)
+    for (const id of [...origenes.keys()]) if (!abiertas.has(id) && id !== deClaude) (origenes.delete(id), editables.delete(id))
   }
   await update($, vista, () => v)
 }

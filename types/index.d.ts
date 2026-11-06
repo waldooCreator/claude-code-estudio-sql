@@ -76,8 +76,29 @@ export type Modelo = {
   pegado: { n: number; texto: string } | null
   /** La última consulta que pidió Claude: el panel la abre en una pestaña; `n` cambia con cada una. */
   encargo: { n: number; pestana: Encargo } | null
+  /** La celda que se está editando en la cuadrícula (doble clic); `n` cambia con cada una. */
+  edicion: Edicion | null
   /** La ventana de filas que trae este dibujo (solo en las props del panel). */
   vista?: Vista
+}
+
+/**
+ * Una celda en edición. `bloqueada`: no se puede editar y `error` dice por qué;
+ * `confirmar`: `sql` es el UPDATE que se ejecutará con `valor`.
+ */
+export type Edicion = {
+  n: number
+  pestana: string
+  conjunto: number
+  fila: number
+  col: number
+  tabla: string
+  columna: string
+  original: string | null
+  estado: 'bloqueada' | 'editando' | 'confirmar' | 'guardando'
+  valor?: string
+  sql?: string
+  error?: string
 }
 
 /** Una consulta que Claude ejecuta a la vista: la pestaña que el panel abre para ella. */
@@ -99,6 +120,10 @@ export type Pedido =
   | { t: 'copiarParte'; pestana: string; conjunto: number; fila: number | null; columna: number | null }
   | { t: 'pegar' }
   | { t: 'ampliar' }
+  | { t: 'editar'; pestana: string; conjunto: number; fila: number; col: number }
+  /** `valor` escrito; «NULL» deja la celda vacía. Sin `confirmado` solo arma el UPDATE para mostrarlo. */
+  | { t: 'guardarCelda'; n: number; valor: string; confirmado: boolean }
+  | { t: 'cancelarEdicion'; n: number }
   /** Solo la vista; cualquier otro pedido también la lleva (el motor entrega un pedido por cuadro). */
   | { t: 'ver' }
 
