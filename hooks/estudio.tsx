@@ -526,7 +526,9 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
     if (b.largo < 4) return
     const pista = b.largo - 2
     const max = Math.max(0, b.max)
-    const pulgar = max === 0 ? pista : limitar(Math.round(pista * b.frac), 1, pista - 1)
+    // El pulgar dice cuánto se ve, pero nunca pasa de media pista: la pista se ve siempre a los lados.
+    // Si no hay nada que desplazar, no hay pulgar.
+    const pulgar = max === 0 ? 0 : limitar(Math.round(pista * b.frac), 1, Math.max(1, Math.floor(pista / 2)))
     const desde = max === 0 ? 0 : Math.round(((pista - pulgar) * limitar(b.pos, 0, max)) / max)
     barras[b.id] = { ...b, max, pista, pulgar, desde }
     const zona = (k: number, n: number, id: string, accion: () => void) =>
@@ -545,7 +547,7 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
         L.put(x, y, k === 0 ? (b.vertical ? '▲' : '◀') : b.vertical ? '▼' : '▶', h ? T.acento : T.tenue, h ? T.pestanaHover : T.cabecera)
       } else {
         const enPulgar = k - 1 >= desde && k - 1 < desde + pulgar
-        L.put(x, y, ' ', T.texto, enPulgar ? (hPulgar || activo ? T.acento : T.sombra) : T.cabecera)
+        L.put(x, y, ' ', T.texto, enPulgar ? (hPulgar || activo ? T.texto : T.tenue) : T.cabecera)
       }
     }
   }
