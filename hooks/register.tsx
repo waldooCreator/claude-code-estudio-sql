@@ -44,14 +44,47 @@ let vivas: Set<string> | null = null
 // dejan copiar por la secuencia OSC 52, así que primero se usan las
 // herramientas del sistema y $.ui.copy queda de respaldo.
 
-const COPIAR: string[][] = [['wl-copy'], ['xclip', '-selection', 'clipboard'], ['xsel', '--clipboard', '--input'], ['pbcopy'], ['clip.exe'], ['clip']]
-const PEGAR: string[][] = [['wl-paste', '--no-newline'], ['xclip', '-selection', 'clipboard', '-o'], ['xsel', '--clipboard', '--output'], ['pbpaste'], ['powershell.exe', '-NoProfile', '-Command', 'Get-Clipboard -Raw'], ['powershell', '-NoProfile', '-Command', 'Get-Clipboard -Raw']]
+// Windows: clip.exe lee la entrada en la página de códigos de la consola y daña
+// las tildes y la ñ; PowerShell lee los bytes tal cual y los decodifica como UTF-8.
+const PS_COPIAR =
+  '$m = New-Object IO.MemoryStream; [Console]::OpenStandardInput().CopyTo($m); ' +
+  'Set-Clipboard -Value ([Text.Encoding]::UTF8.GetString($m.ToArray()))'
+// Y al leer, que escriba en UTF-8 (si no, la consola también daña las tildes).
+const PS_PEGAR = '[Console]::OutputEncoding = [Text.Encoding]::UTF8; Get-Clipboard -Raw'
+const PS = ['-NoProfile', '-NonInteractive', '-Command']
+
+const COPIAR: { argv: string[]; env?: Record<string, string> }[] = [
+  { argv: ['wl-copy'] },
+  { argv: ['xclip', '-selection', 'clipboard'] },
+  { argv: ['xsel', '--clipboard', '--input'] },
+  // Sin un idioma UTF-8, pbcopy lee la entrada como MacRoman y daña las tildes.
+  { argv: ['pbcopy'], env: { LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' } },
+  // powershell.exe también sirve desde WSL.
+  { argv: ['powershell.exe', ...PS, PS_COPIAR] },
+  { argv: ['pwsh', ...PS, PS_COPIAR] },
+]
+const PEGAR: string[][] = [['wl-paste', '--no-newline'], ['xclip', '-selection', 'clipboard', '-o'], ['xsel', '--clipboard', '--output'], ['pbpaste'], ['powershell.exe', ...PS, PS_PEGAR], ['pwsh', ...PS, PS_PEGAR]]
+
+/** El aviso cuando no se pudo copiar, según el sistema. */
+function noCopia(): string {
+  if (sistema.os === 'windows') return 'No pude copiar: Windows no dejó usar PowerShell (Set-Clipboard). Revisa que powershell.exe esté disponible.'
+  if (sistema.os === 'darwin') return 'No pude copiar con pbcopy.'
+  return 'No pude copiar: instala wl-clipboard (Wayland) o xclip (X11), o usa una terminal que deje copiar (OSC 52).'
+}
+
+/** La herramienta que copió por última vez (para el diagnóstico). */
+let copiaCon = ''
+
+/** En Windows, PowerShell primero: así no se intenta lanzar las de Linux en cada copia. */
+const enOrden = <T,>(lista: T[], esPowerShell: (x: T) => boolean): T[] =>
+  sistema.os === 'windows' ? [...lista.filter(esPowerShell), ...lista.filter(x => !esPowerShell(x))] : lista
 
 async function copiarAlSistema($: EngineInterface, texto: string, superficie: string): Promise<boolean> {
-  for (const argv of COPIAR) {
+  await binario($).catch(() => undefined)
+  for (const { argv, env } of enOrden(COPIAR, x => x.argv.includes(PS_COPIAR))) {
     try {
-      const r = await $.process.run(argv, { stdin: texto, timeoutMs: 5000 })
-      if (r.exitCode === 0) return true
+      const r = await $.process.run(argv, { stdin: texto, env, timeoutMs: 5000 })
+      if (r.exitCode === 0) return ((copiaCon = argv[0]!), true)
     } catch {
       // esa herramienta no existe aquí: la siguiente
     }
@@ -64,7 +97,8 @@ async function copiarAlSistema($: EngineInterface, texto: string, superficie: st
 }
 
 async function leerDelSistema($: EngineInterface): Promise<string | null> {
-  for (const argv of PEGAR) {
+  await binario($).catch(() => undefined)
+  for (const argv of enOrden(PEGAR, x => x.includes(PS_PEGAR))) {
     try {
       const r = await $.process.run(argv, { timeoutMs: 5000 })
       if (r.exitCode === 0) return r.stdout.replace(/\r\n/g, '\n')
@@ -86,57 +120,92 @@ const editables = new Map<string, Editable>()
 const MAX_EDICION = 20_000
 /** Cuenta las ediciones: cada una lleva un número nuevo, aunque se haya cancelado la anterior. */
 let ediciones = 0
-let socket: string | null = null
-let arrancando: Promise<string> | null = null
 
 // ── El puente
+//
+// Cómo se le habla: por un socket Unix (Linux y macOS) o, en Windows, por
+// 127.0.0.1 con un token que el puente exige en cada pedido.
+type Transporte = { socket: string } | { url: string; token: string }
+
+let transporte: Transporte | null = null
+let arrancando: Promise<Transporte> | null = null
+/** El proceso del puente: cerrar su flujo lo mata. */
+let hijoPuente: { return: (v?: never) => Promise<unknown> } | null = null
+/** El socket no sirvió con este motor: el puente se vuelve a lanzar por TCP. */
+let forzarTcp = false
+/** Ya respondió al menos un pedido por el transporte actual. */
+let respondio = false
+
+let binarioListo = ''
+let sistema = { os: '', arch: '', como: '' }
 
 async function binario($: EngineInterface): Promise<string> {
+  if (binarioListo) return binarioListo
   let os = 'windows'
   let arch = 'amd64'
-  try {
-    const r = await $.process.run(['uname', '-s', '-m'], { timeoutMs: 5000 })
-    const [s = '', m = ''] = r.stdout.trim().toLowerCase().split(/\s+/)
-    os = s.startsWith('darwin') ? 'darwin' : s.startsWith('linux') ? 'linux' : 'windows'
-    arch = m === 'arm64' || m === 'aarch64' ? 'arm64' : 'amd64'
-  } catch {
-    // sin uname: Windows
+  let como = 'por descarte (no respondió uname)'
+  // Windows lo dice en su variable OS; ahí no se pregunta a uname, que solo existe con Git Bash.
+  // El binario de amd64 también corre en un Windows ARM, emulado.
+  if ((await $.env.get('OS').catch(() => undefined)) === 'Windows_NT') como = 'variable OS=Windows_NT'
+  else {
+    try {
+      const r = await $.process.run(['uname', '-s', '-m'], { timeoutMs: 5000 })
+      if (r.exitCode === 0) {
+        const [s = '', m = ''] = r.stdout.trim().toLowerCase().split(/\s+/)
+        os = s.startsWith('darwin') ? 'darwin' : s.startsWith('linux') ? 'linux' : 'windows'
+        arch = m === 'arm64' || m === 'aarch64' ? 'arm64' : 'amd64'
+        como = `uname: ${r.stdout.trim()}`
+      }
+    } catch {
+      // Sin uname y sin OS=Windows_NT: se intenta con el de Windows.
+    }
   }
-  return `${$.plugin.root}/bin/puente-${os}-${arch}${os === 'windows' ? '.exe' : ''}`
+  sistema = { os, arch, como }
+  binarioListo = `${$.plugin.root}/bin/puente-${os}-${arch}${os === 'windows' ? '.exe' : ''}`
+  return binarioListo
 }
 
-function arrancarPuente($: EngineInterface): Promise<string> {
-  if (socket) return Promise.resolve(socket)
+function arrancarPuente($: EngineInterface): Promise<Transporte> {
+  if (transporte) return Promise.resolve(transporte)
   if (arrancando) return arrancando
   arrancando = (async () => {
     const bin = await binario($)
     if (!(await $.fs.exists(bin))) throw new Error(`No encontré el puente para este sistema (${bin}).`)
-    const hijo = $.process.spawn({ argv: [bin] })
+    const hijo = $.process.spawn({ argv: forzarTcp ? [bin, '-tcp'] : [bin] })
+    hijoPuente = hijo as never
     let primera = ''
-    const listo = new Promise<string>((resolve, reject) => {
+    let anunciado = false
+    const listo = new Promise<Transporte>((resolve, reject) => {
       void (async () => {
         try {
           for await (const trozo of hijo) {
-            if (!('text' in trozo) || trozo.stream !== 'stdout' || socket) continue
+            if (!('text' in trozo) || trozo.stream !== 'stdout' || anunciado) continue
             primera += trozo.text
             const fin = primera.indexOf('\n')
             if (fin < 0) continue
-            const dato = JSON.parse(primera.slice(0, fin)) as { socket?: string; error?: string }
-            if (dato.socket) resolve(dato.socket)
+            anunciado = true
+            const dato = JSON.parse(primera.slice(0, fin)) as { socket?: string; url?: string; token?: string; error?: string }
+            if (dato.socket) resolve({ socket: dato.socket })
+            else if (dato.url && dato.token) resolve({ url: dato.url, token: dato.token })
             else reject(new Error(dato.error ?? 'El puente no arrancó.'))
           }
         } catch (err) {
           reject(err)
         }
-        socket = null
-        arrancando = null
-        await update($, modelo, m => ({ ...m, puente: { listo: false, error: 'El puente se detuvo; se reinicia con la próxima consulta.' } }))
+        // Solo si sigue siendo el puente actual (uno reemplazado no borra al nuevo).
+        if (hijoPuente === (hijo as never)) {
+          transporte = null
+          arrancando = null
+          hijoPuente = null
+          await update($, modelo, m => ({ ...m, puente: { listo: false, error: 'El puente se detuvo; se reinicia con la próxima consulta.' } }))
+        }
         reject(new Error('El puente se cerró antes de arrancar.'))
       })()
     })
-    socket = await listo
+    transporte = await listo
+    respondio = false
     await update($, modelo, m => ({ ...m, puente: { listo: true } }))
-    return socket
+    return transporte
   })()
   arrancando.catch(async err => {
     arrancando = null
@@ -145,9 +214,36 @@ function arrancarPuente($: EngineInterface): Promise<string> {
   return arrancando
 }
 
+/** Detiene el puente actual (el próximo pedido lanza otro). */
+function detenerPuente(): void {
+  const hijo = hijoPuente
+  hijoPuente = null
+  transporte = null
+  arrancando = null
+  void hijo?.return().catch(() => undefined)
+}
+
+function pedirAlPuente($: EngineInterface, t: Transporte, ruta: string, cuerpo: unknown) {
+  const init = { method: 'POST', body: JSON.stringify(cuerpo) }
+  return 'socket' in t
+    ? $.http.fetch(`http://puente${ruta}`, { ...init, socketPath: t.socket })
+    : $.http.fetch(`${t.url}${ruta}`, { ...init, headers: { 'X-Estudio-Token': t.token } })
+}
+
 async function puente<T>($: EngineInterface, ruta: string, cuerpo: unknown): Promise<T> {
-  const sock = await arrancarPuente($)
-  const r = await $.http.fetch(`http://puente${ruta}`, { method: 'POST', body: JSON.stringify(cuerpo), socketPath: sock })
+  const t = await arrancarPuente($)
+  let r
+  try {
+    r = await pedirAlPuente($, t, ruta, cuerpo)
+  } catch (err) {
+    // El primer pedido por el socket ni siquiera llegó: este motor no habla por
+    // sockets Unix aquí. Se relanza el puente por 127.0.0.1 y se reintenta una vez.
+    if (!('socket' in t) || respondio || forzarTcp) throw err
+    forzarTcp = true
+    detenerPuente()
+    r = await pedirAlPuente($, await arrancarPuente($), ruta, cuerpo)
+  }
+  respondio = true
   const dato = JSON.parse(r.text) as T & { error?: string }
   if (dato.error) throw new Error(dato.error)
   return dato
@@ -518,7 +614,7 @@ async function atender($: EngineInterface, p: Pedido, superficie: 'terminal' | s
       const rs = completos.get(p.pestana)?.[0]
       if (!rs) return
       const ok = await copiarAlSistema($, comoTabla(rs.columnas, rs.filas, p.formato === 'csv' ? ',' : '\t'), superficie)
-      $.ui.toast(ok ? `Copiadas ${rs.filas.length} filas${p.formato === 'csv' ? ' como CSV' : ''}.` : NO_COPIA)
+      $.ui.toast(ok ? `Copiadas ${rs.filas.length} filas${p.formato === 'csv' ? ' como CSV' : ''}.` : noCopia())
       return
     }
     case 'copiarParte': {
@@ -540,11 +636,11 @@ async function atender($: EngineInterface, p: Pedido, superficie: 'terminal' | s
         texto = comoTabla(rs.columnas, rs.filas, '\t')
         que = `Copiadas ${rs.filas.length} filas con encabezados.`
       }
-      $.ui.toast((await copiarAlSistema($, texto, superficie)) ? que : NO_COPIA)
+      $.ui.toast((await copiarAlSistema($, texto, superficie)) ? que : noCopia())
       return
     }
     case 'copiarTexto': {
-      $.ui.toast((await copiarAlSistema($, p.texto, superficie)) ? p.que : NO_COPIA)
+      $.ui.toast((await copiarAlSistema($, p.texto, superficie)) ? p.que : noCopia())
       return
     }
     case 'pegar': {
@@ -693,9 +789,71 @@ async function consultarAVista($: EngineInterface, a: PedidoClaude, signal?: Abo
 const aTextoCompleto = (v: unknown): string | null =>
   v === null || v === undefined ? null : typeof v === 'string' ? v : typeof v === 'number' || typeof v === 'boolean' ? String(v) : JSON.stringify(v)
 
-// ── Registro
+// ── Diagnóstico: qué hay y qué falta en este equipo
 
-const NO_COPIA = 'No pude copiar: instala wl-clipboard (Wayland) o xclip (X11).'
+/** La primera de estas órdenes que responde: para saber qué portapapeles hay. */
+async function primeraQueResponde($: EngineInterface, opciones: string[][]): Promise<string | null> {
+  for (const argv of opciones) {
+    try {
+      if ((await $.process.run(argv, { timeoutMs: 8000 })).exitCode === 0) return argv[0]!
+    } catch {
+      // no está: la siguiente
+    }
+  }
+  return null
+}
+
+async function diagnosticar($: EngineInterface): Promise<string> {
+  const lineas: string[] = ['Diagnóstico de Estudio SQL', '']
+  const bien = (t: string) => lineas.push(`✔ ${t}`)
+  const mal = (t: string) => lineas.push(`✘ ${t}`)
+  const v = await $.session.version().catch(() => undefined)
+  lineas.push(`Claude Code: ${v?.version ?? 'desconocida'} (se necesita 2.1.303 o más reciente)`)
+  binarioListo = ''
+  const bin = await binario($)
+  lineas.push(`Sistema detectado: ${sistema.os} ${sistema.arch} (${sistema.como})`)
+  lineas.push(`Carpeta del mod: ${$.plugin.root}`)
+  lineas.push('')
+  if (!(await $.fs.exists(bin).catch(() => false))) {
+    mal(`No está el puente para este sistema: ${bin}`)
+    lineas.push('  La carpeta bin/ del mod está incompleta. Vuelve a clonar el repositorio o revisa que el antivirus no lo haya borrado.')
+  } else {
+    bien(`Puente: ${bin}`)
+    const inicio = Date.now()
+    try {
+      const d = await puente<{ version: string; os: string; arch: string; transporte: string; llavero: { ok: boolean; nombre: string; detalle: string } }>($, '/diagnostico', {})
+      bien(`El puente arranca y responde (versión ${d.version}, ${d.os}/${d.arch}, ${Date.now() - inicio} ms)`)
+      const t = transporte
+      bien(`Transporte: ${t && 'socket' in t ? `socket Unix privado (${t.socket})` : `TCP local con token (${t && 'url' in t ? t.url : '127.0.0.1'})`}${forzarTcp ? ' — el socket no funcionó aquí y se pasó a TCP' : ''}`)
+      if (d.llavero.ok) bien(`Llavero para las contraseñas: ${d.llavero.nombre}`)
+      else {
+        mal(`Llavero para las contraseñas: ${d.llavero.nombre} no responde`)
+        lineas.push(`  ${d.llavero.detalle}`)
+      }
+    } catch (err) {
+      mal(`El puente no arranca: ${mensaje(err)}`)
+      if (sistema.os === 'windows') lineas.push('  En Windows suele ser el antivirus o SmartScreen bloqueando el .exe (no está firmado). Ábrelo una vez desde el Explorador y elige «Ejecutar de todas formas», o agrega la carpeta bin\\ del mod a las exclusiones de Windows Defender.')
+      else lineas.push(`  Prueba darle permiso de ejecución: chmod +x "${bin}"`)
+    }
+  }
+  const portapapeles =
+    sistema.os === 'windows'
+      ? await primeraQueResponde($, [['powershell.exe', ...PS, 'Get-Command Set-Clipboard | Out-Null'], ['pwsh', ...PS, 'Get-Command Set-Clipboard | Out-Null']])
+      : sistema.os === 'darwin'
+        ? 'pbcopy'
+        : await primeraQueResponde($, [['wl-copy', '--version'], ['xclip', '-version'], ['xsel', '--version'], ['powershell.exe', ...PS, 'Get-Command Set-Clipboard | Out-Null']])
+  if (portapapeles) bien(`Portapapeles: ${portapapeles}${copiaCon ? ` (la última copia usó ${copiaCon})` : ''}`)
+  else mal('Portapapeles: no hay wl-clipboard ni xclip ni xsel. Es opcional: sin ellos se copia por la terminal (OSC 52), que no todas las terminales permiten.')
+  lineas.push('')
+  const m = await read($, modelo)
+  lineas.push(`Conexiones guardadas: ${m.conexiones.length}${m.conexiones.length ? ` (${m.conexiones.map(c => `${c.nombre}: ${c.motor}`).join(', ')})` : ' — créalas en /sql → + Nueva conexión'}`)
+  lineas.push('  Se guardan sin contraseñas en el almacén de mods de Claude Code (~/.claude/plugins/store/estudio-sql_…json); las contraseñas, en el llavero del sistema.')
+  lineas.push(`Ancho de la terminal: ${columnasTerminal > 0 ? `${columnasTerminal} columnas` : 'todavía no se sabe (abre /sql una vez)'}; el panel necesita unas 110 o más (o pantalla completa).`)
+  lineas.push(`Herramienta de Claude: mcp__estudio-sql__${HERRAMIENTA}`)
+  return lineas.join('\n')
+}
+
+// ── Registro
 
 /** Ancho pedido al panel: normal, o casi toda la terminal dejando un poco de conversación. */
 function anchoPanel(ampliado: boolean): number {
@@ -714,6 +872,16 @@ export const register: Register = on => {
     const tema = ((await $.store.get('tema')) as Modelo['tema'] | undefined) ?? 'claro'
     await update($, modelo, m => ({ ...m, conexiones, tema }))
     await $.command.register({ name: 'sql', description: 'Abre Estudio SQL: tus conexiones, el editor y los resultados' })
+    await $.command.register({ name: 'sql-diagnostico', description: 'Revisa que Estudio SQL funcione en este equipo: puente, llavero y portapapeles' })
+    await $.tool.register({
+      name: 'diagnostico',
+      description:
+        'Revisa la instalación de Estudio SQL en este equipo: sistema detectado, si el puente arranca y por dónde se le habla (socket o TCP), ' +
+        'si el llavero del sistema guarda contraseñas, qué portapapeles hay y cuántas conexiones están guardadas. ' +
+        'Úsala al instalar el mod (ver INSTALAR.md en la carpeta del mod) o cuando una conexión falla sin motivo claro. No toca ninguna base de datos.',
+      inputSchema: { type: 'object', properties: {} },
+      isDeferred: false,
+    })
     await $.tool.register({
       name: HERRAMIENTA,
       description:
@@ -742,6 +910,12 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__estudio-sql__consultar' as never }, async ($, e, next) => ({
     result: await consultarAVista($, e as unknown as PedidoClaude, next.signal),
   })).catch(() => ({ result: 'Estudio SQL no pudo ejecutar la consulta: el mod falló. Abre /sql y revisa la barra de estado.' }))
+
+  on('command.run', { command: 'sql-diagnostico' }, async $ => ({ text: await diagnosticar($) }))
+
+  on('tool.call', { tool: 'mcp__estudio-sql__diagnostico' as never }, async $ => ({ result: await diagnosticar($) })).catch(() => ({
+    result: 'El diagnóstico falló dentro del mod. Revisa la carpeta del mod y ejecuta claude plugin validate sobre ella.',
+  }))
 
   on('command.run', { command: 'sql' }, async $ => {
     const abierto = (await $.ui.panes()).some(p => p.id === PANEL)

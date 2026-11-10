@@ -4,13 +4,13 @@ import type { On } from 'claude-code'
 // Barras de desplazamiento del editor y de los resultados: flechas, pista y
 // pulgar arrastrable. El puente es falso: nada toca una base.
 
-const HGI = { id: 'chgi', nombre: 'HGI', motor: 'mssql', host: 'falso.invalid', puerto: '1433', usuario: 'x', base: 'B', color: '#c42b1c', soloLectura: true, ssh: null }
+const TIENDA = { id: 'ctienda', nombre: 'Tienda', motor: 'mssql', host: 'falso.invalid', puerto: '1433', usuario: 'x', base: 'B', color: '#c42b1c', soloLectura: true, ssh: null }
 
 type Conj = { columnas: string[]; tipos?: string[]; filas: unknown[][]; mensajes?: string[] }
 
-function erp(n: number): Conj {
-  const columnas = ['IntEmpresa', 'IntTransaccion', 'IntDocumento', 'DatFecha', 'DatFecha1', 'DatVencimiento', 'IntAno', 'IntPeriodo', 'IntAnoCartera', 'IntPeriodoCartera', 'StrTercero', 'StrClase', 'IntCartera', 'StrCCosto', 'IntEstado', 'IntValor', 'IntIva', 'IntTotal', 'StrReferencia', 'StrUsuario', 'StrObservaciones', 'IntBodega', 'StrVendedor']
-  const filas = Array.from({ length: n }, (_, i) => [1, 'HE', 2499293 - i, '2026-10-30 13:45:12.000', '2026-10-30 13:45:12.000', '2026-10-30 00:00:00.000', 2026, 10, 2026, 10, '222222222222', '13050502', 0, '01', 0, '125000.0000', '19950.0000', '144950.0000', 'FE-' + (998877 - i), 'SPEED', 'Venta POS isla 3 turno 2', '01', '1094567890'])
+function ventas(n: number): Conj {
+  const columnas = ['NumEmpresa', 'TipoVenta', 'NumVenta', 'FechaVenta', 'FechaRegistro', 'FechaVence', 'NumAnio', 'NumMes', 'NumAnioCorte', 'NumMesCorte', 'CodCliente', 'CodCategoria', 'NumCartera', 'CodSucursal', 'NumEstado', 'ValBase', 'ValImpuesto', 'ValTotal', 'TxtReferencia', 'TxtCajero', 'TxtNotas', 'NumBodega', 'CodVendedor']
+  const filas = Array.from({ length: n }, (_, i) => [1, 'VT', 1000000 - i, '2026-10-30 13:45:12.000', '2026-10-30 13:45:12.000', '2026-10-30 00:00:00.000', 2026, 10, 2026, 10, '000000000000', '00000000', 0, '01', 0, '125000.0000', '19950.0000', '144950.0000', 'FV-' + (998877 - i), 'CAJA1', 'Venta de mostrador caja 3', '01', '0000000000'])
   return { columnas, filas }
 }
 
@@ -23,7 +23,7 @@ function puente(on: On, conj: () => Conj, objetos = 0, paraPegar = ''): void {
   on('process.run', ($, e) => ({ value: { exitCode: 0, stdout: e.argv[0] === 'uname' ? 'Linux x86_64\n' : e.argv[0] === 'wl-paste' ? paraPegar : '', stderr: '' } }) as never)
   on('fs.exists', () => ({ value: true }) as never)
   on('process.spawn', async function* () { yield { stream: 'stdout', text: '{"socket":"/tmp/p.sock"}\n' }; return { value: { code: 0, signal: null } } } as never)
-  on('store.get', ($, e) => ({ value: e.key === 'conexiones' ? [HGI] : undefined }) as never)
+  on('store.get', ($, e) => ({ value: e.key === 'conexiones' ? [TIENDA] : undefined }) as never)
   on('store.set', () => ({ value: undefined }) as never)
   on('ui.panes', () => ({ value: [{ id: 'estudio-sql' }] }) as never)
   on('command.register', () => ({ value: undefined }) as never)
@@ -87,7 +87,7 @@ async function montar($: any, W = 134, H = 42) {
     await ui.pointer({ type: 'down', x, y, button: 'left' })
     await ui.pointer({ type: 'up', x, y, button: 'left' })
   }
-  const consultar = (titulo: string) => $.tool.call({ tool: 'mcp__estudio-sql__consultar', conexion: 'HGI', sql: 'SELECT TOP (1000) * FROM t', titulo } as never)
+  const consultar = (titulo: string) => $.tool.call({ tool: 'mcp__estudio-sql__consultar', conexion: 'Tienda', sql: 'SELECT TOP (1000) * FROM ventas', titulo } as never)
   return { ui, lineas, props, clic, clicFila1, consultar }
 }
 

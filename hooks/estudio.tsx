@@ -800,15 +800,20 @@ const Estudio = (m: Modelo, surface: ClientSurface<Estado>) => {
   function camposDe(d: Dialogo): [string, string, string][] {
     const lite = d.motor === 'sqlite'
     const f: [string, string, string][] = [['nombre', 'Nombre', 'Ej.: Producción']]
-    if (lite) f.push(['host', 'Archivo', '/ruta/a/base.db'])
-    else
+    if (lite) f.push(['host', 'Archivo', '/ruta/a/base.db o C:\\datos\\base.db'])
+    else {
+      // SQL Server: la instancia con nombre va en el servidor, y sin usuario
+      // se entra con la sesión de Windows (solo con Claude Code en Windows).
+      const ms = d.motor === 'mssql'
+      const sesionWindows = ms && !d.campos.usuario?.trim()
       f.push(
-        ['host', 'Servidor', 'IP o nombre: 192.168.1.10, 100.x.x.x…'],
-        ['puerto', 'Puerto', ''],
-        ['usuario', 'Usuario', ''],
-        ['clave', 'Contraseña', d.id ? '(sin cambios)' : ''],
+        ['host', 'Servidor', ms ? 'IP, nombre o EQUIPO\\SQLEXPRESS' : 'IP o nombre: 192.168.1.10, 100.x.x.x…'],
+        ['puerto', 'Puerto', ms ? 'vacío = 1433 o el de la instancia' : ''],
+        ['usuario', 'Usuario', ms ? 'vacío = tu sesión de Windows' : ''],
+        ['clave', 'Contraseña', d.id ? '(sin cambios)' : sesionWindows ? '(no hace falta con sesión de Windows)' : ''],
         ['base', 'Base', '(opcional)'],
       )
+    }
     if (d.ssh && !lite) f.push(['sshHost', 'Equipo SSH', 'usuario@equipo-intermedio'], ['sshLlave', 'Llave SSH', '~/.ssh/id_ed25519 (o el agente)'])
     return f
   }

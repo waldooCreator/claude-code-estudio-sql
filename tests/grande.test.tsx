@@ -6,13 +6,13 @@ import type { On } from 'claude-code'
 // pasa de 100 000 caracteres; antes bastaba un SELECT TOP (1000) * de una tabla
 // de ~15 columnas. El puente es falso: nada toca una base.
 
-const HGI = { id: 'chgi', nombre: 'HGI', motor: 'mssql', host: 'falso.invalid', puerto: '1433', usuario: 'x', base: 'B', color: '#c42b1c', soloLectura: true, ssh: null }
+const TIENDA = { id: 'ctienda', nombre: 'Tienda', motor: 'mssql', host: 'falso.invalid', puerto: '1433', usuario: 'x', base: 'B', color: '#c42b1c', soloLectura: true, ssh: null }
 
 type Conj = { columnas: string[]; tipos?: string[]; filas: unknown[][]; mensajes?: string[] }
 
-function erp(n: number): Conj {
-  const columnas = ['IntEmpresa', 'IntTransaccion', 'IntDocumento', 'DatFecha', 'DatFecha1', 'DatVencimiento', 'IntAno', 'IntPeriodo', 'IntAnoCartera', 'IntPeriodoCartera', 'StrTercero', 'StrClase', 'IntCartera', 'StrCCosto', 'IntEstado', 'IntValor', 'IntIva', 'IntTotal', 'StrReferencia', 'StrUsuario', 'StrObservaciones', 'IntBodega', 'StrVendedor']
-  const filas = Array.from({ length: n }, (_, i) => [1, 'HE', 2499293 - i, '2026-10-30 13:45:12.000', '2026-10-30 13:45:12.000', '2026-10-30 00:00:00.000', 2026, 10, 2026, 10, '222222222222', '13050502', 0, '01', 0, '125000.0000', '19950.0000', '144950.0000', 'FE-' + (998877 - i), 'SPEED', 'Venta POS isla 3 turno 2', '01', '1094567890'])
+function ventas(n: number): Conj {
+  const columnas = ['NumEmpresa', 'TipoVenta', 'NumVenta', 'FechaVenta', 'FechaRegistro', 'FechaVence', 'NumAnio', 'NumMes', 'NumAnioCorte', 'NumMesCorte', 'CodCliente', 'CodCategoria', 'NumCartera', 'CodSucursal', 'NumEstado', 'ValBase', 'ValImpuesto', 'ValTotal', 'TxtReferencia', 'TxtCajero', 'TxtNotas', 'NumBodega', 'CodVendedor']
+  const filas = Array.from({ length: n }, (_, i) => [1, 'VT', 1000000 - i, '2026-10-30 13:45:12.000', '2026-10-30 13:45:12.000', '2026-10-30 00:00:00.000', 2026, 10, 2026, 10, '000000000000', '00000000', 0, '01', 0, '125000.0000', '19950.0000', '144950.0000', 'FV-' + (998877 - i), 'CAJA1', 'Venta de mostrador caja 3', '01', '0000000000'])
   return { columnas, filas }
 }
 
@@ -25,7 +25,7 @@ function puente(on: On, conj: () => Conj, objetos = 0, paraPegar = ''): void {
   on('process.run', ($, e) => ({ value: { exitCode: 0, stdout: e.argv[0] === 'uname' ? 'Linux x86_64\n' : e.argv[0] === 'wl-paste' ? paraPegar : '', stderr: '' } }) as never)
   on('fs.exists', () => ({ value: true }) as never)
   on('process.spawn', async function* () { yield { stream: 'stdout', text: '{"socket":"/tmp/p.sock"}\n' }; return { value: { code: 0, signal: null } } } as never)
-  on('store.get', ($, e) => ({ value: e.key === 'conexiones' ? [HGI] : undefined }) as never)
+  on('store.get', ($, e) => ({ value: e.key === 'conexiones' ? [TIENDA] : undefined }) as never)
   on('store.set', () => ({ value: undefined }) as never)
   on('ui.panes', () => ({ value: [{ id: 'estudio-sql' }] }) as never)
   on('command.register', () => ({ value: undefined }) as never)
@@ -89,7 +89,7 @@ async function montar($: any, W = 134, H = 42) {
     await ui.pointer({ type: 'down', x, y, button: 'left' })
     await ui.pointer({ type: 'up', x, y, button: 'left' })
   }
-  const consultar = (titulo: string) => $.tool.call({ tool: 'mcp__estudio-sql__consultar', conexion: 'HGI', sql: 'SELECT TOP (1000) * FROM t', titulo } as never)
+  const consultar = (titulo: string) => $.tool.call({ tool: 'mcp__estudio-sql__consultar', conexion: 'Tienda', sql: 'SELECT TOP (1000) * FROM ventas', titulo } as never)
   return { ui, lineas, props, clic, clicFila1, consultar }
 }
 
@@ -100,11 +100,11 @@ async function bajoElTope(props: () => Promise<{ caracteres: number; valores: nu
 }
 
 test('tabla de 23 columnas × 1000 filas (SELECT TOP 1000 *): se ve, normal y ampliado', async ($, on) => {
-  puente(on, () => erp(1000))
+  puente(on, () => ventas(1000))
   for (const [W, H] of [[134, 42], [189, 42], [260, 70]] as const) {
     const p = await montar($, W, H)
     await p.consultar('ancha')
-    expect((await p.lineas()).join('\n')).toContain('IntEmpresa')
+    expect((await p.lineas()).join('\n')).toContain('NumEmpresa')
     await bajoElTope(p.props)
     await p.ui.unmount()
   }
@@ -142,10 +142,10 @@ test('celdas de 1 MB: se ven recortadas con «…»', async ($, on) => {
 })
 
 test('muchas consultas grandes seguidas no se acumulan hasta el negro', async ($, on) => {
-  puente(on, () => erp(500))
+  puente(on, () => ventas(500))
   const p = await montar($)
   for (let i = 0; i < 8; i++) await p.consultar('c' + i)
-  expect((await p.lineas()).join('\n')).toContain('IntEmpresa')
+  expect((await p.lineas()).join('\n')).toContain('NumEmpresa')
   await bajoElTope(p.props)
   const { p: modelo } = await p.props()
   // Claude conserva 4 pestañas: las cerradas ya no viajan ni se guardan.
@@ -154,7 +154,7 @@ test('muchas consultas grandes seguidas no se acumulan hasta el negro', async ($
 })
 
 test('reabrir /sql después de una consulta grande dibuja el panel', async ($, on) => {
-  puente(on, () => erp(1000))
+  puente(on, () => ventas(1000))
   const p = await montar($)
   await p.consultar('grande')
   await p.lineas()
@@ -195,15 +195,15 @@ test('un número largo después de la fila 200 se ve entero, no cortado', async 
 test('una base con 2500 tablas en el explorador no deja el panel en negro', async ($, on) => {
   puente(on, () => rejilla(1, 1), 2500)
   const p = await montar($)
-  await p.clic('◆ HGI', 2)
+  await p.clic('◆ Tienda', 2)
   await p.clic(/▸ ▪ B\b/, 0)
   await p.clic('Tablas', 0)
   expect((await p.lineas()).join('\n')).toContain('Tabla0000')
   await bajoElTope(p.props)
   // Viajan 300; el panel sabe que hay 2500 y lo dice al final de la lista.
   const { p: modelo } = await p.props()
-  expect(modelo.esquemas.chgi.objetos.B.length).toBe(300)
-  expect(modelo.esquemas.chgi.totales.B.table).toBe(2500)
+  expect(modelo.esquemas.ctienda.objetos.B.length).toBe(300)
+  expect(modelo.esquemas.ctienda.totales.B.table).toBe(2500)
   await p.ui.unmount()
 })
 

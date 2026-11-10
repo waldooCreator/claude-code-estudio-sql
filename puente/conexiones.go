@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,9 +36,9 @@ import (
 type Conn struct {
 	ID       string   `json:"id"`
 	Engine   string   `json:"engine"` // mssql | postgres | mysql | sqlite
-	Host     string   `json:"host"`   // o la ruta del archivo en SQLite
+	Host     string   `json:"host"`   // o la ruta del archivo en SQLite; en SQL Server puede traer la instancia: EQUIPO\SQLEXPRESS
 	Port     string   `json:"port"`
-	User     string   `json:"user"`
+	User     string   `json:"user"` // SQL Server en Windows: vacío = la sesión de Windows (SSPI)
 	Password string   `json:"password,omitempty"` // solo para probar antes de guardar
 	Database string   `json:"database"`
 	ReadOnly bool     `json:"readOnly"`
@@ -79,9 +80,20 @@ func open(ctx context.Context, c Conn, database string) (*sql.DB, error) {
 	if database == "" {
 		database = c.Database
 	}
-	if c.Password == "" && c.Engine != "sqlite" && c.ID != "" {
-		if p, err := keyring.Get(keyringService, c.ID); err == nil {
+	if c.Engine == "mssql" && c.User == "" && runtime.GOOS != "windows" {
+		return nil, errors.New("Falta el usuario. Dejarlo vacío (entrar con la sesión de Windows) solo funciona cuando Claude Code corre en Windows; aquí escribe un usuario de SQL Server, o DOMINIO\\usuario con su contraseña.")
+	}
+	// Por qué no hay contraseña, si no la hay: sirve para explicar un «login failed».
+	var faltaClave error
+	if c.Password == "" && c.Engine != "sqlite" && c.ID != "" && c.User != "" {
+		p, err := keyring.Get(keyringService, c.ID)
+		switch {
+		case err == nil:
 			c.Password = p
+		case errors.Is(err, keyring.ErrNotFound):
+			faltaClave = errors.New("No hay contraseña guardada para esta conexión: edítala y escríbela de nuevo.")
+		default:
+			faltaClave = fmt.Errorf("No pude leer la contraseña de %s (%v). %s", nombreLlavero(), err, ayudaLlavero())
 		}
 	}
 	key := c.poolKey(database)
@@ -97,21 +109,27 @@ func open(ctx context.Context, c Conn, database string) (*sql.DB, error) {
 	}
 	poolMu.Unlock()
 
-	host, port := c.Host, c.Port
-	if port == "" {
-		port = defaultPort(c.Engine)
+	host, port, instance := c.Host, c.Port, ""
+	if c.Engine == "mssql" {
+		host, port, instance = mssqlServidor(c.Host, c.Port)
 	}
 	var tun *tunnel
 	if c.SSH != nil && c.SSH.Host != "" && c.Engine != "sqlite" {
+		// Por el túnel no pasa la consulta al SQL Browser: va al puerto (1433 si no se dio).
+		if port == "" {
+			port = defaultPort(c.Engine)
+		}
 		t, err := openTunnel(*c.SSH, net.JoinHostPort(host, port))
 		if err != nil {
 			return nil, err
 		}
 		tun = t
-		host, port = "127.0.0.1", strconv.Itoa(t.port)
+		host, port, instance = "127.0.0.1", strconv.Itoa(t.port), ""
+	} else if port == "" && instance == "" {
+		port = defaultPort(c.Engine)
 	}
 
-	driver, dsn, err := dsnFor(c, host, port, database)
+	driver, dsn, err := dsnFor(c, host, port, instance, database)
 	if err != nil {
 		tun.Close()
 		return nil, err
@@ -128,6 +146,9 @@ func open(ctx context.Context, c Conn, database string) (*sql.DB, error) {
 	if err := db.PingContext(pctx); err != nil {
 		db.Close()
 		tun.Close()
+		if faltaClave != nil && esLoginFallido(err) {
+			return nil, fmt.Errorf("%v (%s)", faltaClave, err)
+		}
 		return nil, friendly(err)
 	}
 	poolMu.Lock()
@@ -148,7 +169,31 @@ func defaultPort(engine string) string {
 	return ""
 }
 
-func dsnFor(c Conn, host, port, database string) (string, string, error) {
+// mssqlServidor separa la instancia con nombre (EQUIPO\SQLEXPRESS) del
+// equipo. Con instancia y sin puerto propio, el puerto lo dice el SQL Browser
+// del servidor; el 1433 que el formulario pone de entrada no cuenta como propio.
+func mssqlServidor(servidor, puerto string) (host, port, instance string) {
+	host, port = strings.TrimSpace(servidor), strings.TrimSpace(puerto)
+	if i := strings.IndexByte(host, '\\'); i >= 0 {
+		host, instance = host[:i], host[i+1:]
+	}
+	if host == "." || strings.EqualFold(host, "(local)") || host == "" {
+		host = "localhost"
+	}
+	if instance != "" && port == "1433" {
+		port = ""
+	}
+	return host, port, instance
+}
+
+// esLoginFallido dice si el error es de usuario o contraseña.
+func esLoginFallido(err error) bool {
+	s := err.Error()
+	return strings.Contains(strings.ToLower(s), "login failed") || strings.Contains(s, "password authentication failed") || strings.Contains(s, "Access denied")
+}
+
+// dsnFor arma la cadena de conexión; instance solo cuenta en SQL Server.
+func dsnFor(c Conn, host, port, instance, database string) (string, string, error) {
 	switch c.Engine {
 	case "mssql":
 		q := url.Values{}
@@ -165,7 +210,20 @@ func dsnFor(c Conn, host, port, database string) (string, string, error) {
 			q.Set("TrustServerCertificate", "true")
 		}
 		q.Set("app name", "Estudio SQL")
-		u := url.URL{Scheme: "sqlserver", User: url.UserPassword(c.User, c.Password), Host: net.JoinHostPort(host, port), RawQuery: q.Encode()}
+		u := url.URL{Scheme: "sqlserver", Host: host, RawQuery: q.Encode()}
+		if port != "" {
+			u.Host = net.JoinHostPort(host, port)
+		} else if strings.Contains(host, ":") {
+			u.Host = "[" + host + "]" // IPv6 sin puerto
+		}
+		if instance != "" {
+			u.Path = "/" + instance
+		}
+		// Sin usuario ni contraseña el driver entra con la sesión de Windows (SSPI);
+		// con DOMINIO\usuario y contraseña, con esa cuenta de Windows.
+		if c.User != "" || c.Password != "" {
+			u.User = url.UserPassword(c.User, c.Password)
+		}
 		return "sqlserver", u.String(), nil
 	case "postgres":
 		db := database
@@ -190,6 +248,8 @@ func dsnFor(c Conn, host, port, database string) (string, string, error) {
 		if c.ReadOnly {
 			mode = "ro"
 		}
+		// SQLite lee la ruta como URI: en Windows con «/» (C:/datos/base.db).
+		path = filepath.ToSlash(path)
 		return "sqlite", "file:" + path + "?mode=" + mode + "&_pragma=busy_timeout(5000)", nil
 	}
 	return "", "", fmt.Errorf("Motor desconocido: %q", c.Engine)
@@ -207,7 +267,9 @@ func friendly(err error) error {
 		return fmt.Errorf("Se perdió la conexión con el servidor (la red o el túnel SSH se cayó). Vuelve a ejecutar: se abre una conexión nueva. (%s)", s)
 	case strings.Contains(s, "no such host"):
 		return fmt.Errorf("No se encontró el servidor por ese nombre. Revisa que esté bien escrito o usa la IP. (%s)", s)
-	case strings.Contains(strings.ToLower(s), "login failed"), strings.Contains(s, "password authentication failed"), strings.Contains(s, "Access denied"):
+	case strings.Contains(s, "unable to get instances from Sql Server Browser"), strings.Contains(s, "No instance matching"):
+		return fmt.Errorf("No encontré esa instancia de SQL Server. Revisa el nombre (EQUIPO\\INSTANCIA), que el servicio «SQL Server Browser» esté encendido y que el firewall deje pasar UDP 1434; o escribe el puerto fijo de la instancia. (%s)", s)
+	case esLoginFallido(err):
 		return fmt.Errorf("Usuario o contraseña incorrectos. (%s)", s)
 	}
 	return err
@@ -305,6 +367,9 @@ func openTunnel(s SSHConf, target string) (*tunnel, error) {
 	}
 	if user == "" {
 		user = os.Getenv("USER")
+	}
+	if user == "" {
+		user = os.Getenv("USERNAME") // Windows
 	}
 	port := s.Port
 	if port == "" {
@@ -455,16 +520,14 @@ func sshAuth(keyPath string) ([]ssh.AuthMethod, error) {
 		}
 		signers = append(signers, signer)
 	}
-	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
-		if conn, err := net.Dial("unix", sock); err == nil {
-			methods = append(methods, ssh.PublicKeysCallback(agent.NewClient(conn).Signers))
-		}
+	if conn := agenteSSH(); conn != nil {
+		methods = append(methods, ssh.PublicKeysCallback(agent.NewClient(conn).Signers))
 	}
 	if len(signers) > 0 {
 		methods = append([]ssh.AuthMethod{ssh.PublicKeys(signers...)}, methods...)
 	}
 	if len(methods) == 0 {
-		return nil, errors.New("No encontré una llave SSH ni un agente SSH. Indica la ruta de tu llave privada.")
+		return nil, errors.New("No encontré una llave SSH ni un agente SSH. Indica la ruta de tu llave privada (por ejemplo ~/.ssh/id_ed25519).")
 	}
 	return methods, nil
 }
@@ -474,11 +537,28 @@ func homeDir() string {
 	return h
 }
 
+// agenteSSH se conecta al agente SSH: el de SSH_AUTH_SOCK, o en Windows el
+// servicio «OpenSSH Authentication Agent» por su tubería con nombre.
+func agenteSSH() io.ReadWriter {
+	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+		if conn, err := net.Dial("unix", sock); err == nil {
+			return conn
+		}
+	}
+	if runtime.GOOS == "windows" {
+		if f, err := os.OpenFile(`\\.\pipe\openssh-ssh-agent`, os.O_RDWR, 0); err == nil {
+			return f
+		}
+	}
+	return nil
+}
+
+// expandHome cambia «~» por la carpeta personal: ~/x y, en Windows, ~\x.
 func expandHome(p string) string {
 	if p == "~" {
 		return homeDir()
 	}
-	if strings.HasPrefix(p, "~/") {
+	if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
 		return filepath.Join(homeDir(), p[2:])
 	}
 	return p
@@ -496,7 +576,7 @@ func handleSecretSet(in secretIn) (any, error) {
 		return nil, errors.New("Falta el id de la conexión.")
 	}
 	if err := keyring.Set(keyringService, in.ID, in.Password); err != nil {
-		return nil, fmt.Errorf("No pude guardar la contraseña en el llavero del sistema: %v", err)
+		return nil, fmt.Errorf("La conexión se guardó, pero la contraseña no: no pude guardarla en %s (%v). %s", nombreLlavero(), err, ayudaLlavero())
 	}
 	return map[string]bool{"ok": true}, nil
 }
@@ -526,4 +606,44 @@ func closeConn(string) {
 		p.tunnel.Close()
 		delete(pool, k)
 	}
+}
+
+// nombreLlavero es el nombre del llavero de este sistema, como lo conoce la persona.
+func nombreLlavero() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "el Administrador de credenciales de Windows"
+	case "darwin":
+		return "el Llavero de macOS"
+	}
+	return "el llavero del sistema (Secret Service: GNOME Keyring o KWallet)"
+}
+
+// ayudaLlavero explica qué hacer cuando el llavero no responde.
+func ayudaLlavero() string {
+	if runtime.GOOS == "linux" {
+		return "En Linux sin escritorio, por SSH o en WSL no suele haber llavero: instala gnome-keyring (o KWallet) y ábrelo en tu sesión. Mientras tanto, solo funcionan las conexiones sin contraseña (como SQLite)."
+	}
+	return "Revisa que el llavero del sistema esté disponible para tu usuario."
+}
+
+// llaveroDisponible pregunta al llavero por una entrada que no existe: si
+// responde «no está», funciona. Con un tope de tiempo, porque D-Bus puede colgarse.
+func llaveroDisponible() (bool, string) {
+	var detalle string
+	err := withTimeout(5*time.Second, func() error {
+		_, err := keyring.Get(keyringService, "__diagnostico__")
+		if err == nil || errors.Is(err, keyring.ErrNotFound) {
+			return nil
+		}
+		return err
+	})
+	if err != nil {
+		detalle = err.Error()
+		if strings.Contains(detalle, "SSH no respondió") {
+			detalle = "el llavero no respondió a tiempo"
+		}
+		return false, detalle + ". " + ayudaLlavero()
+	}
+	return true, ""
 }
